@@ -49,7 +49,7 @@ MONTHLY_LUMP_SERVICES = {
     "AWS Support (Enterprise)",
 }
 
-# Analysis thresholds
+# Insights thresholds
 DOD_PCT_THRESHOLD = 30.0        # flag DoD moves larger than this %
 DOD_ABS_THRESHOLD_USD = 5.0     # ...and larger than this $ amount
 ANOMALY_MULTIPLIER = 2.0        # yesterday > N× 30d avg
@@ -183,15 +183,14 @@ class AccountSummary:
     account_id: str
     account_name: str
     report_date: date
-    # Per-service table, sorted by yesterday cost desc. EXCLUDES lump services.
+    # Per-service table, sorted by yesterday cost desc. EXCLUDES lump services
+    # (AWS Support etc.) — they are dropped up front because AmortizedCost does
+    # not spread them, which would otherwise skew the 30d avg row and trip
+    # false Appeared/Disappeared insights.
     # Columns: service, yesterday, day_before, avg_30d, avg_90d, hist_30d_sum
     # hist_30d_sum is the T-30..T-1 window (excludes report_date) and is used
     # purely for "appeared / disappeared" presence detection.
     services: pl.DataFrame
-    # Lump services (AWS Support etc.) shown in their own block.
-    # Columns: service, amount_30d, last_charged
-    monthly_recurring: pl.DataFrame
-    # Totals EXCLUDE lump services so daily comparisons stay meaningful.
     total_yesterday: float
     total_day_before: float
     total_avg_30d: float
@@ -205,7 +204,6 @@ def build_account_summary(
     report_date: date,
 ) -> AccountSummary:
     """Aggregate one account's cost frame into an AccountSummary."""
-    acct_all = df.filter(pl.col("account_id") == account_id)
     empty_services = pl.DataFrame(
         schema={
             "service": pl.Utf8,
@@ -216,20 +214,17 @@ def build_account_summary(
             "hist_30d_sum": pl.Float64,
         }
     )
-    empty_recurring = pl.DataFrame(
-        schema={
-            "service": pl.Utf8,
-            "amount_30d": pl.Float64,
-            "last_charged": pl.Date,
-        }
+    # Drop lumpy monthly services before any aggregation (see dataclass note).
+    acct = df.filter(
+        (pl.col("account_id") == account_id)
+        & (~pl.col("service").is_in(list(MONTHLY_LUMP_SERVICES)))
     )
-    if acct_all.is_empty():
+    if acct.is_empty():
         return AccountSummary(
             account_id=account_id,
             account_name=account_name,
             report_date=report_date,
             services=empty_services,
-            monthly_recurring=empty_recurring,
             total_yesterday=0.0,
             total_day_before=0.0,
             total_avg_30d=0.0,
@@ -240,28 +235,6 @@ def build_account_summary(
     start_30d = report_date - timedelta(days=29)  # inclusive 30-day window
     start_90d = report_date - timedelta(days=89)  # inclusive 90-day window
     hist_start = report_date - timedelta(days=30)  # T-30..T-1 (excludes today)
-
-    # Split lumpy monthly services off into their own frame — they would
-    # otherwise distort the 30d avg row and trigger Appeared/Disappeared.
-    lump_list = list(MONTHLY_LUMP_SERVICES)
-    acct = acct_all.filter(~pl.col("service").is_in(lump_list))
-    acct_lump = acct_all.filter(pl.col("service").is_in(lump_list))
-
-    if acct_lump.is_empty():
-        monthly_recurring = empty_recurring
-    else:
-        monthly_recurring = (
-            acct_lump.filter(
-                (pl.col("date") >= start_30d) & (pl.col("date") <= report_date)
-            )
-            .group_by("service")
-            .agg(
-                pl.col("cost").sum().alias("amount_30d"),
-                pl.col("date").filter(pl.col("cost") > 0).max().alias("last_charged"),
-            )
-            .filter(pl.col("amount_30d") > 0)
-            .sort("amount_30d", descending=True)
-        )
 
     yesterday = (
         acct.filter(pl.col("date") == report_date)
@@ -289,39 +262,38 @@ def build_account_summary(
         .agg(pl.col("cost").sum().alias("hist_30d_sum"))
     )
 
-    if acct.is_empty():
-        services = empty_services
-    else:
-        services = (
-            yesterday.join(prev_day, on="service", how="full", coalesce=True)
-            .join(avg_30, on="service", how="full", coalesce=True)
-            .join(avg_90, on="service", how="full", coalesce=True)
-            .join(hist_30d, on="service", how="full", coalesce=True)
-            .fill_null(0.0)
-            .sort("yesterday", descending=True)
-        )
+    services = (
+        yesterday.join(prev_day, on="service", how="full", coalesce=True)
+        .join(avg_30, on="service", how="full", coalesce=True)
+        .join(avg_90, on="service", how="full", coalesce=True)
+        .join(hist_30d, on="service", how="full", coalesce=True)
+        .fill_null(0.0)
+        .sort("yesterday", descending=True)
+    )
 
     return AccountSummary(
         account_id=account_id,
         account_name=account_name,
         report_date=report_date,
         services=services,
-        monthly_recurring=monthly_recurring,
-        total_yesterday=float(services["yesterday"].sum()) if not services.is_empty() else 0.0,
-        total_day_before=float(services["day_before"].sum()) if not services.is_empty() else 0.0,
-        total_avg_30d=float(services["avg_30d"].sum()) if not services.is_empty() else 0.0,
-        total_avg_90d=float(services["avg_90d"].sum()) if not services.is_empty() else 0.0,
+        total_yesterday=float(services["yesterday"].sum()),
+        total_day_before=float(services["day_before"].sum()),
+        total_avg_30d=float(services["avg_30d"].sum()),
+        total_avg_90d=float(services["avg_90d"].sum()),
     )
 
 
 # -----------------------------------------------------------------------------
-# Analysis (rule-based, no LLM)
+# Insights (rule-based, no LLM)
 # -----------------------------------------------------------------------------
-def analyze(summary: AccountSummary) -> list[str]:
-    """Return bullet points surfacing interesting movements for an account."""
+def build_insights(summary: AccountSummary) -> list[str]:
+    """Return bullet points surfacing interesting movements for an account.
+
+    Returns an empty list when nothing noteworthy is found, so the merged
+    top-of-report section can skip quiet accounts entirely.
+    """
     notes: list[str] = []
     if summary.services.is_empty() or summary.total_yesterday == 0:
-        notes.append("_No cost data for this account on the report day._")
         return notes
 
     for row in summary.services.iter_rows(named=True):
@@ -371,8 +343,6 @@ def analyze(summary: AccountSummary) -> list[str]:
                 "volumes, NAT Gateway data, snapshots, etc."
             )
 
-    if not notes:
-        notes.append("_Nothing unusual today._")
     return notes
 
 
@@ -497,7 +467,7 @@ def _fmt_delta_pct(a: float, b: float) -> str:
 
 def write_report(
     summaries: list[AccountSummary],
-    analyses: dict[str, list[str]],
+    insights: dict[str, list[str]],
     chart_paths: dict[str, Path],
     report_date: date,
     out_dir: Path,
@@ -512,10 +482,26 @@ def write_report(
     lines.append(
         "_Metric: AmortizedCost. Excluded record types: "
         f"{', '.join(EXCLUDED_RECORD_TYPES)}. "
-        f"Monthly lump services pulled into their own block: "
+        "Monthly lump services excluded from the daily view: "
         f"{', '.join(sorted(MONTHLY_LUMP_SERVICES))}._"
     )
     lines.append("")
+
+    # Merged insights across all accounts — quiet accounts are skipped so the
+    # section surfaces only what is actually worth looking at.
+    lines.append("## Insights")
+    lines.append("")
+    noisy_accounts = [s for s in summaries if insights.get(s.account_id)]
+    if not noisy_accounts:
+        lines.append("_Nothing unusual across any account today._")
+        lines.append("")
+    else:
+        for s in noisy_accounts:
+            lines.append(f"**{s.account_name}** (`{s.account_id}`)")
+            lines.append("")
+            for note in insights[s.account_id]:
+                lines.append(f"- {note}")
+            lines.append("")
 
     # Org-wide summary table
     lines.append("## Summary across accounts")
@@ -575,23 +561,6 @@ def write_report(
                 f"| {_fmt_delta_pct(row['yesterday'], row['avg_30d'])} |"
             )
         lines.append("")
-        lines.append("### Analysis")
-        lines.append("")
-        for note in analyses[s.account_id]:
-            lines.append(f"- {note}")
-        lines.append("")
-
-        if not s.monthly_recurring.is_empty():
-            lines.append("### Monthly recurring (excluded from main view)")
-            lines.append("")
-            lines.append("| Service | Last 30d | Last charged |")
-            lines.append("|---|---:|---|")
-            for row in s.monthly_recurring.iter_rows(named=True):
-                last = row["last_charged"].isoformat() if row["last_charged"] else "—"
-                lines.append(
-                    f"| {row['service']} | {_fmt_usd(row['amount_30d'])} | {last} |"
-                )
-            lines.append("")
 
     path = out_dir / "report.md"
     path.write_text("\n".join(lines))
@@ -619,13 +588,13 @@ def main() -> int:
 
     # Pass 1: build every account summary so we can derive a stable palette
     summaries: list[AccountSummary] = []
-    analyses: dict[str, list[str]] = {}
+    insights: dict[str, list[str]] = {}
     for acct_id in sorted(accounts):
         name = accounts[acct_id]
         logger.info("Processing %s (%s)", name, acct_id)
         summary = build_account_summary(df, acct_id, name, rpt_date)
         summaries.append(summary)
-        analyses[acct_id] = analyze(summary)
+        insights[acct_id] = build_insights(summary)
 
     # Pass 2: render charts with a palette that is consistent across accounts
     color_map = build_service_palette(summaries)
@@ -636,7 +605,7 @@ def main() -> int:
     # Sort report sections by yesterday cost desc (biggest spenders first)
     summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
 
-    report_path = write_report(summaries, analyses, chart_paths, rpt_date, out_dir)
+    report_path = write_report(summaries, insights, chart_paths, rpt_date, out_dir)
     logger.info("Wrote %s", report_path)
     return 0
 
