@@ -29,6 +29,38 @@ import matplotlib.pyplot as plt  # noqa: E402
 import polars as pl  # noqa: E402
 import seaborn as sns  # noqa: E402
 
+# Module-level chart theme — one place to own the aesthetic.
+sns.set_theme(style="white", context="notebook")
+matplotlib.rcParams.update(
+    {
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"],
+        "axes.titlesize": 15,
+        "axes.titleweight": "semibold",
+        "axes.titlepad": 14,
+        "axes.titlecolor": "#222222",
+        "axes.labelsize": 11,
+        "axes.labelcolor": "#3a3a3a",
+        "axes.edgecolor": "#cccccc",
+        "axes.linewidth": 0.8,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "axes.axisbelow": True,
+        "xtick.color": "#555555",
+        "ytick.color": "#555555",
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 10,
+        "legend.frameon": False,
+        "legend.fontsize": 9,
+        "grid.color": "#eeeeee",
+        "grid.linewidth": 0.8,
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.dpi": 140,
+    }
+)
+
 # -----------------------------------------------------------------------------
 # Config (tweak freely — kept at top for visibility)
 # -----------------------------------------------------------------------------
@@ -48,6 +80,19 @@ MONTHLY_LUMP_SERVICES = {
     "AWS Support (Business)",
     "AWS Support (Enterprise)",
 }
+
+# Hand-picked strong categorical palette — Carto "Bold" extended with "Prism".
+# Designed for categorical data (high saturation, distinguishable hues). No
+# extra dependency, just good design choices. Cycles if the org's top-N cross
+# the palette size.
+STRONG_PALETTE = [
+    "#7F3C8D", "#11A579", "#3969AC", "#F2B701", "#E73F74",
+    "#80BA5A", "#E68310", "#008695", "#CF1C90", "#F97B72",
+    "#4B4B8F", "#A5AA99",
+    "#1D6996", "#38A6A5", "#0F8554", "#73AF48",
+    "#EDAD08", "#E17C05", "#CC503E", "#94346E",
+]
+OTHER_COLOR = "#BDBDBD"
 
 # Insights thresholds
 DOD_PCT_THRESHOLD = 30.0        # flag DoD moves larger than this %
@@ -349,13 +394,13 @@ def build_insights(summary: AccountSummary) -> list[str]:
 # -----------------------------------------------------------------------------
 # Chart rendering
 # -----------------------------------------------------------------------------
-def build_service_palette(summaries: list[AccountSummary]) -> dict[str, tuple]:
+def build_service_palette(summaries: list[AccountSummary]) -> dict[str, str]:
     """Assign a stable color per service across all accounts.
 
-    Any service that appears in *any* account's top-N chart slot gets a unique
-    color; per-account 'Other' rollups share a fixed gray. Colors are assigned
-    in descending order of total yesterday spend so the most visible services
-    get the most distinct hues.
+    Any service that appears in *any* account's top-N chart slot gets a color
+    from STRONG_PALETTE, ordered by descending total yesterday spend so the
+    biggest services land on the first (most distinct) slots. The palette
+    cycles if there are more services than slots. 'Other' is a fixed gray.
     """
     totals: dict[str, float] = {}
     for s in summaries:
@@ -364,20 +409,18 @@ def build_service_palette(summaries: list[AccountSummary]) -> dict[str, tuple]:
                 totals.get(row["service"], 0.0) + row["yesterday"]
             )
     ranked = sorted(totals.keys(), key=lambda k: -totals[k])
-    n = len(ranked)
-    if n == 0:
-        return {"Other": (0.7, 0.7, 0.7)}
-    # husl = perceptually uniform, scales to any N, looks less 90s than tab20
-    palette = sns.color_palette("husl", n_colors=n)
-    color_map: dict[str, tuple] = {svc: palette[i] for i, svc in enumerate(ranked)}
-    color_map["Other"] = (0.7, 0.7, 0.7)
+    color_map: dict[str, str] = {
+        svc: STRONG_PALETTE[i % len(STRONG_PALETTE)]
+        for i, svc in enumerate(ranked)
+    }
+    color_map["Other"] = OTHER_COLOR
     return color_map
 
 
 def render_chart(
     summary: AccountSummary,
     charts_dir: Path,
-    color_map: dict[str, tuple],
+    color_map: dict[str, str],
 ) -> Path:
     """Render a stacked bar: 3 bars (Yesterday / 30d avg / 90d avg).
 
@@ -387,7 +430,7 @@ def render_chart(
     path = charts_dir / f"{summary.account_id}.png"
 
     if summary.services.is_empty() or summary.total_yesterday == 0:
-        fig, ax = plt.subplots(figsize=(8, 3))
+        fig, ax = plt.subplots(figsize=(10, 3.5))
         ax.text(
             0.5,
             0.5,
@@ -395,9 +438,11 @@ def render_chart(
             ha="center",
             va="center",
             transform=ax.transAxes,
+            color="#888888",
+            fontsize=12,
         )
         ax.set_axis_off()
-        fig.savefig(path, bbox_inches="tight", dpi=120)
+        fig.savefig(path)
         plt.close(fig)
         return path
 
@@ -421,8 +466,7 @@ def render_chart(
     categories = ["Yesterday", "30d avg", "90d avg"]
     value_cols = ["yesterday", "avg_30d", "avg_90d"]
 
-    sns.set_theme(style="whitegrid")
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(11, 6.5))
     bottoms = [0.0, 0.0, 0.0]
     for row in chart_df.iter_rows(named=True):
         svc = row["service"]
@@ -431,23 +475,49 @@ def render_chart(
             categories,
             heights,
             bottom=bottoms,
-            color=color_map.get(svc, (0.5, 0.5, 0.5)),
+            color=color_map.get(svc, "#999999"),
             label=svc,
+            width=0.55,
+            edgecolor="white",
+            linewidth=0.8,
         )
         bottoms = [b + h for b, h in zip(bottoms, heights)]
 
+    # Total label on top of each bar — makes the chart scannable without
+    # squinting at the y-axis.
+    max_total = max(bottoms) if bottoms else 0
+    offset = max_total * 0.015
+    for i, total in enumerate(bottoms):
+        ax.text(
+            i,
+            total + offset,
+            f"${total:,.0f}",
+            ha="center",
+            va="bottom",
+            fontsize=11,
+            fontweight="semibold",
+            color="#222222",
+        )
+
     ax.set_ylabel("USD")
+    ax.set_ylim(0, max_total * 1.12 if max_total > 0 else 1)
     ax.set_title(
-        f"{summary.account_name} ({summary.account_id}) — {summary.report_date} UTC"
+        f"{summary.account_name}  ·  {summary.account_id}  ·  "
+        f"{summary.report_date} UTC",
+        loc="left",
+    )
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"${x:,.0f}")
     )
     ax.legend(
         bbox_to_anchor=(1.02, 1),
         loc="upper left",
         borderaxespad=0,
-        fontsize=8,
+        handlelength=1.2,
+        handleheight=1.2,
     )
     fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight", dpi=120)
+    fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     return path
 
