@@ -1,8 +1,3 @@
-output "ecr_repository_url" {
-  description = "Push the Lambda container image here (see scripts/deploy.sh)"
-  value       = aws_ecr_repository.this.repository_url
-}
-
 output "lambda_function_name" {
   description = "Name of the Lambda function (for manual invoke / logs)"
   value       = aws_lambda_function.reporter.function_name

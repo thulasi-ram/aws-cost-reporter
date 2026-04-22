@@ -5,6 +5,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.0"
+    }
   }
 }
 
@@ -54,12 +58,6 @@ variable "lambda_timeout_seconds" {
   description = "Lambda timeout. CE call + 10 charts + uploads finishes well inside this"
   type        = number
   default     = 300
-}
-
-variable "image_tag" {
-  description = "ECR image tag to deploy. Push an image to this tag before applying."
-  type        = string
-  default     = "latest"
 }
 
 variable "log_retention_days" {
