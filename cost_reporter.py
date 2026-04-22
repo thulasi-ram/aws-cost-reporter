@@ -3,7 +3,8 @@
 
 Pulls daily cost data from Cost Explorer for all accounts under an AWS
 Organization (from the payer account), computes daily/monthly/quarterly
-comparisons per account, and writes a combined markdown report to disk.
+comparisons per account, and writes a single-file HTML report (ApexCharts
+via CDN) to disk.
 
 Run:
     uv sync
@@ -13,6 +14,8 @@ Run:
 """
 
 import argparse
+import html
+import json
 import logging
 import os
 import sys
@@ -70,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         default=os.environ.get("OUTPUT_DIR", "./report"),
-        help="Where to write report.md (default: ./report)",
+        help="Where to write report.html (default: ./report)",
     )
     p.add_argument(
         "--date",
@@ -448,109 +451,480 @@ def fmt_delta_pct(a: float, b: float, *, arrow: bool = False) -> str:
     return f"{pct:+.1f}%"
 
 
-def write_report(
-    summaries: list[AccountSummary],
-    insights: dict[str, list[str]],
-    report_date: date,
-    out_dir: Path,
-) -> Path:
-    lines: list[str] = []
-    lines.append(f"# AWS Cost Report — {report_date} (UTC)")
-    lines.append("")
-    lines.append(
-        f"_Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
-    )
-    lines.append("")
-    lines.append(
-        "_Metric: AmortizedCost. Excluded record types: "
-        f"{', '.join(EXCLUDED_RECORD_TYPES)}. "
-        "Monthly lump services excluded from the daily view: "
-        f"{', '.join(sorted(MONTHLY_LUMP_SERVICES))}._"
-    )
-    lines.append("")
+# Number of trailing days of history embedded into the HTML for charts.
+HTML_TREND_DAYS = 30
 
-    # Merged insights across all accounts — quiet accounts are skipped so the
-    # section surfaces only what is actually worth looking at.
-    lines.append("## Insights")
-    lines.append("")
-    noisy_accounts = [s for s in summaries if insights.get(s.account_id)]
-    if not noisy_accounts:
-        lines.append("_Nothing unusual across any account today._")
-        lines.append("")
-    else:
-        for s in noisy_accounts:
-            lines.append(f"**{s.account_name}** (`{s.account_id}`)")
-            lines.append("")
-            for note in insights[s.account_id]:
-                lines.append(f"- {note}")
-            lines.append("")
 
-    # Org-wide summary table
-    lines.append("## Summary across accounts")
-    lines.append("")
-    lines.append("| Account | Day | Day Before | 30d Avg | 90d Avg | Δ% DoD |")
-    lines.append("|---|---:|---:|---:|---:|---:|")
+def _org_daily_series(df: pl.DataFrame, end: date, days: int) -> list[dict]:
+    """Return [{date, cost}] for the org total across the last `days` days."""
+    if df.is_empty():
+        return []
+    start = end - timedelta(days=days - 1)
+    agg = (
+        df.filter(~pl.col("service").is_in(list(MONTHLY_LUMP_SERVICES)))
+        .filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        .group_by("date")
+        .agg(pl.col("cost").sum())
+        .sort("date")
+    )
+    return [
+        {"date": row["date"].isoformat(), "cost": float(row["cost"])}
+        for row in agg.iter_rows(named=True)
+    ]
+
+
+def _account_daily_series(
+    df: pl.DataFrame, account_id: str, end: date, days: int
+) -> list[dict]:
+    """Return [{date, cost}] for one account across the last `days` days."""
+    if df.is_empty():
+        return []
+    start = end - timedelta(days=days - 1)
+    agg = (
+        df.filter(pl.col("account_id") == account_id)
+        .filter(~pl.col("service").is_in(list(MONTHLY_LUMP_SERVICES)))
+        .filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        .group_by("date")
+        .agg(pl.col("cost").sum())
+        .sort("date")
+    )
+    return [
+        {"date": row["date"].isoformat(), "cost": float(row["cost"])}
+        for row in agg.iter_rows(named=True)
+    ]
+
+
+def _safe_json(obj: object) -> str:
+    """json.dumps with </script> sequences neutered for safe inline embedding."""
+    return json.dumps(obj, separators=(",", ":")).replace("</", "<\\/")
+
+
+_HTML_STYLE = """
+:root {
+  --bg: #0b0d10;
+  --panel: #13161a;
+  --panel-hi: #1a1f25;
+  --border: #232932;
+  --fg: #e6eaf0;
+  --muted: #8892a0;
+  --accent: #6ea8fe;
+  --up: #ef6c6c;
+  --down: #51cf66;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { background: var(--bg); color: var(--fg); margin: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  padding: 28px 20px 64px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
+h2 { font-size: 16px; margin: 0 0 12px; font-weight: 600; }
+h3 { font-size: 15px; margin: 0; font-weight: 600; }
+code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.meta { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px;
+  margin-bottom: 18px;
+}
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+.kpi {
+  background: var(--panel-hi);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.kpi .label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.kpi .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
+.kpi .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.up { color: var(--up); }
+.down { color: var(--down); }
+.chart-wrap { margin-top: 12px; }
+.insights ul { margin: 0; padding-left: 18px; }
+.insights li { margin: 2px 0; }
+.insights .acct-label {
+  font-weight: 600;
+  margin-top: 12px;
+  margin-bottom: 2px;
+}
+.insights .acct-label:first-child { margin-top: 0; }
+.acct-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.grid-2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 18px;
+}
+@media (max-width: 760px) {
+  .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-2 { grid-template-columns: minmax(0, 1fr); }
+}
+table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 14px; }
+th, td {
+  text-align: right; padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 500; font-size: 11px;
+     text-transform: uppercase; letter-spacing: 0.04em; }
+tr:last-child td { border-bottom: none; }
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  background: #23384f;
+  color: #9fc2ff;
+}
+.tag.up { background: #3a1f22; color: #ff9c9c; }
+.tag.down { background: #1f3a28; color: #8be3a4; }
+"""
+
+
+_HTML_SCRIPT = """
+const DATA = window.__COST_DATA__;
+
+const chartBase = {
+  chart: {
+    toolbar: { show: false },
+    foreColor: '#8892a0',
+    fontFamily: 'inherit',
+    animations: { enabled: false },
+  },
+  grid: { borderColor: '#232932', strokeDashArray: 3 },
+  tooltip: { theme: 'dark', x: { format: 'yyyy-MM-dd' } },
+};
+
+function fmtUsd(v) {
+  return '$' + Number(v).toLocaleString(undefined, {
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  });
+}
+
+function renderLine(elId, series, opts = {}) {
+  const el = document.getElementById(elId);
+  if (!el || !series.length) return;
+  new ApexCharts(el, {
+    ...chartBase,
+    chart: { ...chartBase.chart, type: 'area', height: opts.height || 180 },
+    stroke: { curve: 'smooth', width: 2 },
+    fill: {
+      type: 'gradient',
+      gradient: { shadeIntensity: 0.6, opacityFrom: 0.35, opacityTo: 0.05 },
+    },
+    colors: [opts.color || '#6ea8fe'],
+    dataLabels: { enabled: false },
+    xaxis: {
+      type: 'datetime',
+      labels: { style: { colors: '#8892a0', fontSize: '11px' } },
+      axisBorder: { show: false }, axisTicks: { show: false },
+    },
+    yaxis: {
+      labels: {
+        style: { colors: '#8892a0', fontSize: '11px' },
+        formatter: (v) => '$' + Math.round(v).toLocaleString(),
+      },
+    },
+    tooltip: { ...chartBase.tooltip, y: { formatter: fmtUsd } },
+    series: [{ name: opts.name || 'Cost', data: series.map(d => [d.date, d.cost]) }],
+  }).render();
+}
+
+function renderServicesBar(elId, services) {
+  const el = document.getElementById(elId);
+  if (!el || !services.length) return;
+  new ApexCharts(el, {
+    ...chartBase,
+    chart: { ...chartBase.chart, type: 'bar', height: Math.max(220, services.length * 26), stacked: false },
+    plotOptions: { bar: { horizontal: true, barHeight: '70%', borderRadius: 3 } },
+    colors: ['#6ea8fe', '#384860'],
+    dataLabels: { enabled: false },
+    legend: { position: 'top', horizontalAlign: 'right', fontSize: '12px' },
+    xaxis: {
+      labels: {
+        style: { colors: '#8892a0', fontSize: '11px' },
+        formatter: (v) => '$' + Math.round(v).toLocaleString(),
+      },
+    },
+    yaxis: { labels: { style: { colors: '#e6eaf0', fontSize: '12px' } } },
+    tooltip: { ...chartBase.tooltip, y: { formatter: fmtUsd }, x: { show: false } },
+    series: [
+      { name: 'Day', data: services.map(s => ({ x: s.service, y: s.yesterday })) },
+      { name: '30d avg', data: services.map(s => ({ x: s.service, y: s.avg_30d })) },
+    ],
+  }).render();
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  renderLine('org-trend', DATA.org_trend, { name: 'Org total', height: 220 });
+  for (const a of DATA.accounts) {
+    renderLine('acct-trend-' + a.account_id, a.trend, {
+      name: a.account_name, height: 160,
+    });
+    renderServicesBar('acct-services-' + a.account_id, a.top_services);
+  }
+});
+"""
+
+
+def _delta_pct_html(a: float, b: float) -> str:
+    """Render a DoD/vs-30d delta as a colored tag, or em-dash when undefined."""
+    if b == 0:
+        return '<span class="tag">—</span>'
+    pct = (a - b) / b * 100
+    cls = "up" if pct > 0 else "down"
+    arrow = "↑" if pct > 0 else "↓"
+    return f'<span class="tag {cls}">{arrow}{abs(pct):.1f}%</span>'
+
+
+def _render_insights_html(
+    summaries: list[AccountSummary], insights: dict[str, list[str]]
+) -> str:
+    noisy = [s for s in summaries if insights.get(s.account_id)]
+    if not noisy:
+        return (
+            '<section class="panel insights"><h2>Insights</h2>'
+            '<p style="color:var(--muted);margin:0">'
+            "Nothing unusual across any account today.</p></section>"
+        )
+    parts = ['<section class="panel insights"><h2>Insights</h2>']
+    for s in noisy:
+        parts.append(
+            f'<div class="acct-label">{html.escape(s.account_name)} '
+            f'<code>{html.escape(s.account_id)}</code></div>'
+        )
+        parts.append("<ul>")
+        for note in insights[s.account_id]:
+            # Notes use **bold** markdown — convert to <strong>.
+            safe = html.escape(note)
+            while "**" in safe:
+                safe = safe.replace("**", "<strong>", 1)
+                safe = safe.replace("**", "</strong>", 1)
+            parts.append(f"<li>{safe}</li>")
+        parts.append("</ul>")
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def _render_summary_table_html(summaries: list[AccountSummary]) -> str:
+    rows = []
     for s in summaries:
-        lines.append(
-            f"| {s.account_name} (`{s.account_id}`) "
-            f"| {fmt_usd(s.total_yesterday)} "
-            f"| {fmt_usd(s.total_day_before)} "
-            f"| {fmt_usd(s.total_avg_30d)} "
-            f"| {fmt_usd(s.total_avg_90d)} "
-            f"| {fmt_delta_pct(s.total_yesterday, s.total_day_before)} |"
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(s.account_name)} "
+            f'<code>{html.escape(s.account_id)}</code></td>'
+            f"<td>{fmt_usd(s.total_yesterday)}</td>"
+            f"<td>{fmt_usd(s.total_day_before)}</td>"
+            f"<td>{fmt_usd(s.total_avg_30d)}</td>"
+            f"<td>{fmt_usd(s.total_avg_90d)}</td>"
+            f"<td>{_delta_pct_html(s.total_yesterday, s.total_day_before)}</td>"
+            "</tr>"
         )
     grand_y = sum(s.total_yesterday for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
     grand_30 = sum(s.total_avg_30d for s in summaries)
     grand_90 = sum(s.total_avg_90d for s in summaries)
-    lines.append(
-        f"| **TOTAL** "
-        f"| **{fmt_usd(grand_y)}** "
-        f"| **{fmt_usd(grand_p)}** "
-        f"| **{fmt_usd(grand_30)}** "
-        f"| **{fmt_usd(grand_90)}** "
-        f"| **{fmt_delta_pct(grand_y, grand_p)}** |"
+    rows.append(
+        "<tr>"
+        "<td><strong>TOTAL</strong></td>"
+        f"<td><strong>{fmt_usd(grand_y)}</strong></td>"
+        f"<td><strong>{fmt_usd(grand_p)}</strong></td>"
+        f"<td><strong>{fmt_usd(grand_30)}</strong></td>"
+        f"<td><strong>{fmt_usd(grand_90)}</strong></td>"
+        f"<td>{_delta_pct_html(grand_y, grand_p)}</td>"
+        "</tr>"
     )
-    lines.append("")
+    return (
+        '<section class="panel"><h2>Summary across accounts</h2>'
+        "<table><thead><tr>"
+        "<th>Account</th><th>Day</th><th>Day Before</th>"
+        "<th>30d Avg</th><th>90d Avg</th><th>DoD</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></section>"
+    )
 
-    # Per-account sections
-    for s in summaries:
-        lines.append(f"## {s.account_name} (`{s.account_id}`)")
-        lines.append("")
-        lines.append(
-            f"**Day:** {fmt_usd(s.total_yesterday)}  "
-            f"**Day Before:** {fmt_usd(s.total_day_before)}  "
-            f"**30d Avg:** {fmt_usd(s.total_avg_30d)}  "
-            f"**90d Avg:** {fmt_usd(s.total_avg_90d)}  "
-            f"**DoD:** {fmt_delta_pct(s.total_yesterday, s.total_day_before)}"
-        )
-        lines.append("")
-        lines.append(
-            "| # | Service | Day | Day Before | 30d Avg | 90d Avg "
-            "| % of Day | Δ% DoD | Δ% vs 30d |"
-        )
-        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|")
-        table_rows = s.services.head(TOP_N_TABLE)
-        for i, row in enumerate(table_rows.iter_rows(named=True), 1):
-            pct_of_day = (
-                f"{row['yesterday'] / s.total_yesterday * 100:.1f}%"
-                if s.total_yesterday > 0
-                else "—"
-            )
-            lines.append(
-                f"| {i} | {row['service']} "
-                f"| {fmt_usd(row['yesterday'])} "
-                f"| {fmt_usd(row['day_before'])} "
-                f"| {fmt_usd(row['avg_30d'])} "
-                f"| {fmt_usd(row['avg_90d'])} "
-                f"| {pct_of_day} "
-                f"| {fmt_delta_pct(row['yesterday'], row['day_before'])} "
-                f"| {fmt_delta_pct(row['yesterday'], row['avg_30d'])} |"
-            )
-        lines.append("")
 
-    path = out_dir / "report.md"
-    path.write_text("\n".join(lines))
+def _render_account_card_html(s: AccountSummary) -> str:
+    kpis = (
+        '<div class="kpi-row">'
+        f'<div class="kpi"><div class="label">Day</div>'
+        f'<div class="value">{fmt_usd(s.total_yesterday)}</div></div>'
+        f'<div class="kpi"><div class="label">DoD</div>'
+        f'<div class="value">{_delta_pct_html(s.total_yesterday, s.total_day_before)}</div>'
+        f'<div class="sub">was {fmt_usd(s.total_day_before)}</div></div>'
+        f'<div class="kpi"><div class="label">30d avg</div>'
+        f'<div class="value">{fmt_usd(s.total_avg_30d)}</div>'
+        f'<div class="sub">vs 30d {_delta_pct_html(s.total_yesterday, s.total_avg_30d)}</div></div>'
+        f'<div class="kpi"><div class="label">90d avg</div>'
+        f'<div class="value">{fmt_usd(s.total_avg_90d)}</div></div>'
+        "</div>"
+    )
+
+    rows = []
+    table_rows = s.services.head(TOP_N_TABLE)
+    for i, row in enumerate(table_rows.iter_rows(named=True), 1):
+        pct_of_day = (
+            f"{row['yesterday'] / s.total_yesterday * 100:.1f}%"
+            if s.total_yesterday > 0
+            else "—"
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{i}. {html.escape(row['service'])}</td>"
+            f"<td>{fmt_usd(row['yesterday'])}</td>"
+            f"<td>{fmt_usd(row['day_before'])}</td>"
+            f"<td>{fmt_usd(row['avg_30d'])}</td>"
+            f"<td>{fmt_usd(row['avg_90d'])}</td>"
+            f"<td>{pct_of_day}</td>"
+            f"<td>{_delta_pct_html(row['yesterday'], row['day_before'])}</td>"
+            f"<td>{_delta_pct_html(row['yesterday'], row['avg_30d'])}</td>"
+            "</tr>"
+        )
+
+    charts = (
+        '<div class="grid-2 chart-wrap">'
+        f'<div><div class="label" style="color:var(--muted);font-size:11px;'
+        f'text-transform:uppercase;margin-bottom:4px;">Last {HTML_TREND_DAYS}d</div>'
+        f'<div id="acct-trend-{html.escape(s.account_id)}"></div></div>'
+        f'<div><div class="label" style="color:var(--muted);font-size:11px;'
+        'text-transform:uppercase;margin-bottom:4px;">Top services — Day vs 30d avg</div>'
+        f'<div id="acct-services-{html.escape(s.account_id)}"></div></div>'
+        "</div>"
+    )
+
+    return (
+        '<section class="panel">'
+        '<div class="acct-head">'
+        f"<h2>{html.escape(s.account_name)}</h2>"
+        f'<code>{html.escape(s.account_id)}</code>'
+        "</div>"
+        + kpis
+        + charts
+        + "<table><thead><tr>"
+        "<th>Service</th><th>Day</th><th>Day Before</th>"
+        "<th>30d Avg</th><th>90d Avg</th><th>% of Day</th>"
+        "<th>DoD</th><th>vs 30d</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></section>"
+    )
+
+
+def _build_account_payload(
+    s: AccountSummary, df: pl.DataFrame, top_n: int
+) -> dict:
+    top = s.services.head(top_n)
+    top_services = [
+        {
+            "service": row["service"],
+            "yesterday": float(row["yesterday"]),
+            "avg_30d": float(row["avg_30d"]),
+        }
+        for row in top.iter_rows(named=True)
+    ]
+    return {
+        "account_id": s.account_id,
+        "account_name": s.account_name,
+        "trend": _account_daily_series(df, s.account_id, s.report_date, HTML_TREND_DAYS),
+        "top_services": top_services,
+    }
+
+
+def write_report(
+    summaries: list[AccountSummary],
+    insights: dict[str, list[str]],
+    report_date: date,
+    out_dir: Path,
+    df: pl.DataFrame | None = None,
+) -> Path:
+    """Render a single-file HTML report (charts via ApexCharts CDN).
+
+    `df` is the 95-day cost DataFrame; when omitted (e.g. tests), charts render
+    empty but the page still works.
+    """
+    df = df if df is not None else pl.DataFrame(
+        schema={"date": pl.Date, "account_id": pl.Utf8,
+                "service": pl.Utf8, "cost": pl.Float64}
+    )
+
+    grand_y = sum(s.total_yesterday for s in summaries)
+    grand_p = sum(s.total_day_before for s in summaries)
+    grand_30 = sum(s.total_avg_30d for s in summaries)
+    grand_90 = sum(s.total_avg_90d for s in summaries)
+
+    payload = {
+        "org_trend": _org_daily_series(df, report_date, HTML_TREND_DAYS),
+        "accounts": [_build_account_payload(s, df, TOP_N_TABLE) for s in summaries],
+    }
+
+    header = (
+        '<section class="panel">'
+        f"<h1>AWS Cost Report — {report_date} (UTC)</h1>"
+        f'<div class="meta">'
+        f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        " · AmortizedCost · excludes "
+        f"{', '.join(EXCLUDED_RECORD_TYPES)}"
+        f" and lumpy services ({', '.join(sorted(MONTHLY_LUMP_SERVICES))})."
+        "</div>"
+        '<div class="kpi-row">'
+        f'<div class="kpi"><div class="label">Org total (Day)</div>'
+        f'<div class="value">{fmt_usd(grand_y)}</div></div>'
+        f'<div class="kpi"><div class="label">DoD</div>'
+        f'<div class="value">{_delta_pct_html(grand_y, grand_p)}</div>'
+        f'<div class="sub">was {fmt_usd(grand_p)}</div></div>'
+        f'<div class="kpi"><div class="label">30d avg</div>'
+        f'<div class="value">{fmt_usd(grand_30)}</div>'
+        f'<div class="sub">vs 30d {_delta_pct_html(grand_y, grand_30)}</div></div>'
+        f'<div class="kpi"><div class="label">90d avg</div>'
+        f'<div class="value">{fmt_usd(grand_90)}</div></div>'
+        "</div>"
+        f'<div class="chart-wrap"><div id="org-trend"></div></div>'
+        "</section>"
+    )
+
+    body = (
+        header
+        + _render_insights_html(summaries, insights)
+        + _render_summary_table_html(summaries)
+        + "".join(_render_account_card_html(s) for s in summaries)
+    )
+
+    doc = (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        f"<title>AWS Cost Report — {report_date}</title>"
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<style>{_HTML_STYLE}</style></head><body>"
+        + body
+        + '<script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>'
+        f"<script>window.__COST_DATA__ = {_safe_json(payload)};</script>"
+        f"<script>{_HTML_SCRIPT}</script>"
+        "</body></html>"
+    )
+
+    path = out_dir / "report.html"
+    path.write_text(doc)
     return path
 
 
@@ -582,7 +956,7 @@ def main() -> int:
 
     summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
 
-    report_path = write_report(summaries, insights, rpt_date, out_dir)
+    report_path = write_report(summaries, insights, rpt_date, out_dir, df)
     logger.info("Wrote %s", report_path)
     return 0
 

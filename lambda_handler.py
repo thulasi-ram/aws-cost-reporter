@@ -3,17 +3,22 @@
 Procedural flow:
   1. Read config from environment (set by the Tofu-provisioned Lambda)
   2. Resolve the Slack webhook URL from SSM
-  3. Idempotency check: skip if this report day already succeeded
-  4. Run the shared pipeline from cost_reporter.py (CE -> polars -> markdown)
-  5. Persist the report-day slice to DynamoDB (history + future trend queries)
-  6. Upload markdown report to S3, generate a presigned URL (7 days)
-  7. Post a Slack Block Kit message (rich tables, no images) via urllib
-  8. Write the run marker to DynamoDB so re-invocations are no-ops
-  9. On any failure, post a short Slack error and re-raise so the CloudWatch
+  3. Run the shared pipeline from cost_reporter.py (CE -> polars -> HTML)
+  4. Persist the report-day slice to DynamoDB (history + future trend queries)
+  5. Upload the HTML report to S3, generate a presigned URL (7 days)
+  6. Post a Slack Block Kit message (rich tables, no images) via urllib
+  7. Write the run marker to DynamoDB (audit trail of last successful run)
+  8. On any failure, post a short Slack error and re-raise so the CloudWatch
      alarm fires.
 
+The pipeline is safe to re-run for the same report day: every downstream
+write (DynamoDB PutItem, S3 PutObject) overwrites, so re-invoking just
+refreshes history and re-posts the same report to Slack. That is by
+design — invocation means "notify", and idempotency belongs on the data
+writes, not on the Slack post.
+
 Required environment variables:
-    S3_BUCKET                — bucket for the markdown report
+    S3_BUCKET                — bucket for the HTML report
     DYNAMODB_TABLE           — table for history + run markers
     SLACK_WEBHOOK_SSM_PARAM  — SSM parameter name holding the webhook URL
 Optional:
@@ -86,12 +91,6 @@ def _slack_webhook_url(ssm_param: str) -> str:
 # -----------------------------------------------------------------------------
 # DynamoDB: run markers + history persistence
 # -----------------------------------------------------------------------------
-def _already_ran(table_name: str, report_date: date) -> bool:
-    table = _DDB.Table(table_name)
-    resp = table.get_item(Key={"pk": "run", "sk": report_date.isoformat()})
-    return resp.get("Item", {}).get("status") == "success"
-
-
 def _mark_run(table_name: str, report_date: date, report_url: str) -> None:
     table = _DDB.Table(table_name)
     ttl = int((datetime.now(timezone.utc) + timedelta(days=400)).timestamp())
@@ -186,6 +185,83 @@ def _dod(a: float, b: float) -> str:
     return fmt_delta_pct(a, b, arrow=True)
 
 
+def _delta_emoji(a: float, b: float) -> str:
+    if b == 0:
+        return ":black_small_square:"
+    return ":small_red_triangle:" if a > b else ":small_red_triangle_down:"
+
+
+# Fixed-width column layout for the per-account monospace table.
+# Total width = 26 + 1 + 11 + 1 + 8 + 1 + 11 + 1 + 8 = 68 cols.
+_COL_SERVICE = 26
+_COL_USD = 11
+_COL_PCT = 8
+
+
+def _pct_cell(a: float, b: float) -> str:
+    if b == 0:
+        return "—"
+    return f"{(a - b) / b * 100:+.1f}%"
+
+
+def _usd_cell(x: float) -> str:
+    return f"${x:,.2f}"
+
+
+def _truncate(s: str, width: int) -> str:
+    return s if len(s) <= width else s[: width - 1] + "…"
+
+
+def _table_row(service: str, day: float, day_before: float, avg_30d: float) -> str:
+    return (
+        f"{_truncate(service, _COL_SERVICE):<{_COL_SERVICE}} "
+        f"{_usd_cell(day):>{_COL_USD}} "
+        f"{_pct_cell(day, day_before):>{_COL_PCT}} "
+        f"{_usd_cell(avg_30d):>{_COL_USD}} "
+        f"{_pct_cell(day, avg_30d):>{_COL_PCT}}"
+    )
+
+
+def _account_table(s: AccountSummary) -> str:
+    header = (
+        f"{'Service':<{_COL_SERVICE}} "
+        f"{'Day':>{_COL_USD}} "
+        f"{'DoD':>{_COL_PCT}} "
+        f"{'30d avg':>{_COL_USD}} "
+        f"{'vs 30d':>{_COL_PCT}}"
+    )
+    width = _COL_SERVICE + 1 + _COL_USD + 1 + _COL_PCT + 1 + _COL_USD + 1 + _COL_PCT
+    rule_solid = "─" * width
+    rule_dotted = "·" * width
+    rows = [header, rule_solid]
+    for row in s.services.head(TOP_N_SLACK).iter_rows(named=True):
+        rows.append(
+            _table_row(
+                row["service"], row["yesterday"], row["day_before"], row["avg_30d"]
+            )
+        )
+    rows.append(rule_dotted)
+    rows.append(
+        _table_row(
+            "TOTAL", s.total_yesterday, s.total_day_before, s.total_avg_30d
+        )
+    )
+    return "\n".join(rows)
+
+
+def _rich_preformatted(text: str) -> dict:
+    """Monospace block — Slack renders rich_text_preformatted as a code block."""
+    return {
+        "type": "rich_text",
+        "elements": [
+            {
+                "type": "rich_text_preformatted",
+                "elements": [{"type": "text", "text": text}],
+            }
+        ],
+    }
+
+
 def _slack_payload(
     summaries: list[AccountSummary],
     insights: dict[str, list[str]],
@@ -193,6 +269,17 @@ def _slack_payload(
     report_url: str,
     environment: str,
 ) -> dict:
+    """Build a Block Kit message with clear visual hierarchy.
+
+    Structure per message:
+      [header] [context metadata]
+      [org totals: 4 fields] [divider]
+      [insights section]     [divider]
+      For each account:
+        [header: account name] [context: account id]
+        [rich_text_preformatted: aligned monospace table — TOTAL + top services]
+      [action button: Full report]
+    """
     title = f"AWS Cost Report — {report_date} (UTC)"
     if environment and environment != "prod":
         title += f" [{environment}]"
@@ -203,62 +290,72 @@ def _slack_payload(
             "type": "context",
             "elements": [
                 _mrkdwn(
-                    "_AmortizedCost. Excludes Tax/Refund/Credit and "
-                    "monthly lump services (AWS Support)._"
+                    "_AmortizedCost · excludes Tax/Refund/Credit and monthly "
+                    "lump services (AWS Support)._"
                 )
             ],
         },
-        DIVIDER,
     ]
 
+    # --- Org totals ---
     grand_y = sum(s.total_yesterday for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
     grand_30 = sum(s.total_avg_30d for s in summaries)
-    totals_fields = [
-        ("Org total", fmt_usd(grand_y)),
-        ("DoD", f"{_dod(grand_y, grand_p)}  _({fmt_usd(grand_p)})_"),
-        ("30d avg", fmt_usd(grand_30)),
-        ("vs 30d", _dod(grand_y, grand_30)),
-    ]
+    grand_90 = sum(s.total_avg_90d for s in summaries)
     blocks.append(
         {
             "type": "section",
-            "fields": [_mrkdwn(f"*{k}*\n{v}") for k, v in totals_fields],
+            "fields": [
+                _mrkdwn(f"*Org total (Day)*\n{fmt_usd(grand_y)}"),
+                _mrkdwn(
+                    f"*DoD* {_delta_emoji(grand_y, grand_p)}\n"
+                    f"{_dod(grand_y, grand_p)}  _was {fmt_usd(grand_p)}_"
+                ),
+                _mrkdwn(
+                    f"*30d avg*\n{fmt_usd(grand_30)}  "
+                    f"_({_dod(grand_y, grand_30)})_"
+                ),
+                _mrkdwn(f"*90d avg*\n{fmt_usd(grand_90)}"),
+            ],
         }
     )
     blocks.append(DIVIDER)
 
+    # --- Insights ---
     noisy = [s for s in summaries if insights.get(s.account_id)]
     if noisy:
-        lines = ["*Insights*"]
+        blocks.append(
+            {
+                "type": "section",
+                "text": _mrkdwn(":mag: *Insights*"),
+            }
+        )
         for s in noisy:
-            lines.append(f"*{s.account_name}*")
-            for note in insights[s.account_id][:6]:
-                lines.append(f"• {note}")
-        blocks.append(_section("\n".join(lines)))
+            bullets = [f"• {note}" for note in insights[s.account_id][:6]]
+            blocks.append(
+                _section(f"*{s.account_name}*\n" + "\n".join(bullets))
+            )
     else:
         blocks.append(
-            _section("*Insights*\n_Nothing unusual across any account today._")
+            _section(
+                ":white_check_mark: *Insights*\n"
+                "_Nothing unusual across any account today._"
+            )
         )
     blocks.append(DIVIDER)
 
-    blocks.append(_section("*By account*"))
+    # --- Per-account table ---
     for s in summaries:
-        header = (
-            f"*{s.account_name}*  `{s.account_id}`\n"
-            f"{fmt_usd(s.total_yesterday)}  ·  "
-            f"30d {fmt_usd(s.total_avg_30d)}  ·  "
-            f"90d {fmt_usd(s.total_avg_90d)}  ·  "
-            f"DoD {_dod(s.total_yesterday, s.total_day_before)}"
+        blocks.append(
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{s.account_name} ({s.account_id})",
+                },
+            }
         )
-        svc_lines = [
-            f"  • {row['service']}  "
-            f"{fmt_usd(row['yesterday'])}  "
-            f"({_dod(row['yesterday'], row['day_before'])})"
-            for row in s.services.head(TOP_N_SLACK).iter_rows(named=True)
-        ]
-        text = header + ("\n" + "\n".join(svc_lines) if svc_lines else "")
-        blocks.append(_section(text))
+        blocks.append(_rich_preformatted(_account_table(s)))
 
     blocks.append(
         {
@@ -266,8 +363,9 @@ def _slack_payload(
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Full report"},
+                    "text": {"type": "plain_text", "text": "Open full report"},
                     "url": report_url,
+                    "style": "primary",
                 }
             ],
         }
@@ -277,18 +375,36 @@ def _slack_payload(
 
 
 def _post_slack(webhook_url: str, payload: dict) -> None:
+    """POST a Block Kit payload to a Slack incoming webhook.
+
+    urllib raises HTTPError for non-2xx, so the previous `resp.status >= 300`
+    check was unreachable. Catch HTTPError explicitly and include Slack's
+    response body in the log so invalid-blocks / no-such-channel surface
+    loudly instead of silently.
+    """
+    host = webhook_url.split("/")[2] if "://" in webhook_url else webhook_url
     data = json.dumps(payload).encode("utf-8")
+    logger.info("Posting Slack payload (%d bytes, %d blocks) to %s",
+                len(data), len(payload.get("blocks", [])), host)
     req = urllib.request.Request(
         webhook_url,
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        if resp.status >= 300:
-            raise RuntimeError(
-                f"Slack webhook returned {resp.status}: {resp.read()!r}"
-            )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            logger.info("Slack responded %d: %s", resp.status, body[:200])
+            # Slack webhooks return "ok" on success. Anything else is a warning
+            # (e.g. "invalid_blocks") returned as a 200 — surface it.
+            if body.strip() != "ok":
+                raise RuntimeError(f"Slack webhook non-ok response: {body!r}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Slack webhook HTTP {e.code}: {body!r}"
+        ) from e
 
 
 def _post_slack_error(webhook_url: str, err: Exception, report_date: date) -> None:
@@ -323,15 +439,6 @@ def handler(event: dict, context: object) -> dict:
     report_date = resolve_report_day(date_override)
 
     try:
-        if _already_ran(cfg["ddb_table"], report_date):
-            logger.info(
-                "Report for %s already succeeded — exiting idempotently",
-                report_date,
-            )
-            return {"status": "skipped", "report_date": report_date.isoformat()}
-
-        # Lambda's only writable location is /tmp. Wipe it per invocation so
-        # warm containers don't leak artifacts between runs.
         # Lambda's only writable location is /tmp. Wipe per-invocation so warm
         # containers don't leak artifacts between runs.
         out_dir = Path("/tmp/report")
@@ -359,14 +466,14 @@ def handler(event: dict, context: object) -> dict:
             insights[acct_id] = build_insights(s)
 
         summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
-        report_path = write_report(summaries, insights, report_date, out_dir)
+        report_path = write_report(summaries, insights, report_date, out_dir, df)
 
         # --- Persist raw data to DynamoDB (unfiltered: includes lump services) ---
         _persist_history(cfg["ddb_table"], df, report_date)
 
-        # --- Upload markdown report to S3 and presign ---
-        report_key = f"reports/{report_date.isoformat()}/report.md"
-        _upload_artifact(cfg["s3_bucket"], report_key, report_path, "text/markdown")
+        # --- Upload HTML report to S3 and presign ---
+        report_key = f"reports/{report_date.isoformat()}/report.html"
+        _upload_artifact(cfg["s3_bucket"], report_key, report_path, "text/html")
         ttl_seconds = cfg["ttl_days"] * 24 * 3600
         report_url = _presign(cfg["s3_bucket"], report_key, ttl_seconds)
 
@@ -376,7 +483,7 @@ def handler(event: dict, context: object) -> dict:
         )
         _post_slack(webhook_url, payload)
 
-        # --- Mark run successful (last step so any earlier failure retries) ---
+        # --- Audit marker (updates report_url on every successful run) ---
         _mark_run(cfg["ddb_table"], report_date, report_url)
 
         logger.info("Report posted successfully for %s", report_date)

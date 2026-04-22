@@ -1,11 +1,9 @@
 # aws-cost-reporter
 
 Daily AWS cost report across an AWS Organization. Pulls from Cost Explorer in
-the payer account, persists a per-day slice to DynamoDB, writes a combined
-markdown report to S3, and posts a rich Slack Block Kit summary.
-
-No charts, no images — everything lives in the Slack message or the markdown
-report.
+the payer account, persists a per-day slice to DynamoDB, uploads a single-file
+HTML report (ApexCharts via CDN) to S3, and posts a rich Slack Block Kit
+summary that links out to it.
 
 ## Architecture
 
@@ -17,8 +15,8 @@ EventBridge (03:30 UTC = 09:00 IST)
         │
         ├── Cost Explorer       ← 1 paginated call, 95 days, grouped by account+service
         ├── Organizations       ← human account names
-        ├── DynamoDB            ← daily history + idempotency run marker
-        ├── S3                  ← markdown report (text only)
+        ├── DynamoDB            ← daily history + last-run audit marker
+        ├── S3                  ← HTML report (one file, charts via CDN)
         ├── SSM SecureString    ← Slack webhook URL
         └── Slack webhook       ← Block Kit payload (org totals, insights, per-account)
 ```
@@ -33,7 +31,7 @@ One shared S3 bucket holds everything, organised by prefix:
 │   └── function.zip
 └── reports/
     └── YYYY-MM-DD/
-        └── report.md
+        └── report.html
 ```
 
 ## Prerequisites
@@ -53,7 +51,7 @@ uv sync
 AWS_PROFILE=root uv run cost_reporter.py
 ```
 
-Writes `./report/report.md`. Override the date:
+Writes `./report/report.html` (open it in a browser). Override the date:
 
 ```bash
 uv run cost_reporter.py --date 2026-04-01 --output-dir ./out
@@ -67,10 +65,11 @@ One command does everything — bucket bootstrap, build, tofu init, tofu apply:
 PROJECT_PREFIX=treebo AWS_REGION=ap-south-1 ./scripts/deploy.sh
 ```
 
-- `PROJECT_PREFIX` (optional) — prepended to resource names wherever AWS
-  reserves the `aws` namespace (SSM parameter paths). Without it, the SSM
-  path would be `/aws-cost-reporter-prod/...` which hits
-  `No access to reserved parameter name`.
+- `PROJECT_PREFIX` (**required**) — prepended to every resource name. AWS
+  reserves the `aws` namespace (SSM parameter paths, IAM names, etc.), so
+  an unprefixed SSM path would be `/aws-cost-reporter-prod/...` and AWS
+  would reject it with `No access to reserved parameter name`. `deploy.sh`
+  and tofu both fail fast if it's missing.
 - `AWS_REGION` (optional) — defaults to `us-east-1`. Flows through to both
   the tofu S3 backend and the AWS provider, so the bucket and all resources
   land in the same region.
@@ -127,7 +126,7 @@ All provisioned by tofu except the S3 bucket:
 
 | Resource | Notes |
 |---|---|
-| S3 bucket | **Bootstrapped by `deploy.sh`** (not managed by tofu). Holds tofu state, the lambda zip, and markdown reports under distinct prefixes. |
+| S3 bucket | **Bootstrapped by `deploy.sh`** (not managed by tofu). Holds tofu state, the lambda zip, and HTML reports under distinct prefixes. |
 | `aws_s3_object.lambda_zip` | Uploads the zip. Keyed on source-file hashes to avoid plan/apply drift. |
 | DynamoDB | `(pk, sk)` table — history rows (`pk=account_id`, `sk=date#service`) and run markers (`pk="run"`, `sk=date`). PAY_PER_REQUEST, PITR, 400-day TTL. |
 | SSM SecureString | Slack webhook. Tofu sets a placeholder, `ignore_changes = [value]` so your real value survives. |
@@ -159,8 +158,10 @@ aws lambda invoke \
   /tmp/out.json
 ```
 
-Re-invocations on a date already reported return `{"status":"skipped"}`.
-Delete the DynamoDB item (`pk="run"`, `sk="2026-04-01"`) to force a re-run.
+Re-invocations always re-run the full pipeline and re-post to Slack.
+DynamoDB and S3 writes are idempotent (PutItem / PutObject overwrite),
+so the stored data stays clean across re-runs — only the Slack message
+gets repeated, which is the point of a manual invoke.
 
 ### Tail logs
 
@@ -176,22 +177,31 @@ aws logs tail "$(cd tofu && tofu output -raw cloudwatch_log_group)" --follow
   Rules: DoD jumps (≥30 % and ≥$5), anomalies vs 30d baseline (≥2× and
   ≥$5), services appeared/disappeared vs the previous 30d, and an
   EC2-Other breakdown (EBS / data transfer / misc).
-- **Per-account sections**: header line with yesterday / 30d / 90d / DoD,
-  followed by the top-5 services for that account with DoD arrows.
-- **Full report button** linking to the markdown in S3 (presigned URL, 7 d).
+- **Per-account table**: each account gets its own `header` + `context` +
+  a `rich_text_preformatted` block rendering an aligned monospace table
+  (Service | Day | DoD | 30d avg | vs 30d) with the account TOTAL as
+  the first row and the top-5 services underneath. Block Kit doesn't
+  have a native table, so the preformatted block is the cleanest way to
+  get real column alignment without images.
+- **Full report button** linking to the HTML report in S3 (presigned URL, 7 d).
 
-## What the markdown report contains
+## What the HTML report contains
 
-Everything in Slack plus a full per-account table of the top-15 services
-with yesterday / day-before / 30d avg / 90d avg / % of day / Δ DoD / Δ vs
-30d. Lives at `reports/{date}/report.md` in the bucket.
+Single self-contained HTML file — no build step, ApexCharts loaded from a
+CDN at view time. Lives at `reports/{date}/report.html` in the bucket.
+
+- Org-level KPI strip + 30-day trend line.
+- Insights section (same rules as Slack).
+- Summary-across-accounts table.
+- One card per account with a 30-day sparkline, a Day-vs-30d-avg bar
+  chart of the top services, and a full top-15 service table.
 
 ## Configuration
 
 All tunables live at the top of `cost_reporter.py`:
 
 - `LOOKBACK_DAYS = 95` — covers the 90-day avg plus buffer.
-- `TOP_N_TABLE = 15` — services per account in the markdown table.
+- `TOP_N_TABLE = 15` — services per account in the HTML table.
 - `TOP_N_SLACK = 5` — services per account in the Slack block.
 - `EXCLUDED_RECORD_TYPES = ["Tax", "Refund", "Credit"]`
 - `MONTHLY_LUMP_SERVICES` — AWS Support tiers excluded from the daily view
@@ -213,11 +223,20 @@ variable "schedule_expression" {
 add ECR, image tagging, and cold-start weight. A trimmed zip with
 cross-platform wheels is smaller, simpler, and quicker to deploy.
 
-**Why Block Kit, not charts.** matplotlib + seaborn + pandas + numpy +
-pillow pushed the unzipped package over Lambda's 250 MB limit and
-dominated cold-start import time. Slack Block Kit renders totals, fields,
-and trend arrows natively — no images required, and the message stays
-scannable without leaving Slack.
+**Why Block Kit for Slack, ApexCharts for the HTML.** Slack still gets a
+pure Block Kit payload — no image blocks, no uploaded files — because
+rendering charts in Lambda (matplotlib + seaborn + pandas + numpy +
+pillow) pushed the unzipped package over the 250 MB limit and dominated
+cold-start time. Charts live in the HTML report instead: the Lambda
+emits one HTML file with the raw series inlined as JSON and pulls
+ApexCharts from `cdn.jsdelivr.net` at view time, so Lambda stays tiny
+and the report renders interactive charts in the browser.
+
+**Why no Vue / React.** The report is a static artefact generated
+server-side with pre-computed data. A framework would add a build step
+and bundler weight for no user-visible benefit; vanilla HTML + one
+`<script>` that constructs ApexCharts from `window.__COST_DATA__` keeps
+the file self-contained and trivial to diff.
 
 **Why one bucket.** State, the lambda zip, and reports all live together
 under different prefixes. Avoids managing a separate state bucket, and
@@ -225,10 +244,13 @@ sidesteps the chicken-and-egg of storing tofu state in a tofu-managed
 bucket: the bucket is bootstrapped by `deploy.sh` and intentionally not a
 tofu resource.
 
-**Why `PROJECT_PREFIX`.** AWS reserves parameter paths starting with `aws`,
-so `/aws-cost-reporter-prod/slack-webhook-url` is rejected. The prefix
-prepends to `local.full_name` wherever it matters (SSM, etc.) so the
-project works inside orgs with that constraint.
+**Why `PROJECT_PREFIX` is required.** AWS reserves the `aws` namespace —
+parameter paths starting with `aws` hit `AccessDeniedException: No access
+to reserved parameter name`, and IAM entities with `aws`-prefixed names
+behave unpredictably. Rather than special-casing some resources and
+leaving others to collide, the prefix prepends to every resource name
+(`local.full_name`). Both `deploy.sh` and a tofu `validation` block on
+`var.project_prefix` fail fast when it's missing.
 
 **Why `x86_64-manylinux_2_28`.** Lambda Python 3.12 runs on Amazon Linux
 2023 (glibc 2.34). Newer packages (numpy, contourpy) stopped shipping

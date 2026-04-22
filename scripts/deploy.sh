@@ -13,11 +13,20 @@ PROJECT_PREFIX="${PROJECT_PREFIX:-}"
 PROJECT_NAME="aws-cost-reporter-prod"
 REGION="${AWS_REGION:-us-east-1}"
 
-if [[ -n "$PROJECT_PREFIX" ]]; then
-  BUCKET="${PROJECT_PREFIX}-${PROJECT_NAME}"
-else
-  BUCKET="${PROJECT_NAME}"
+if [[ -z "$PROJECT_PREFIX" ]]; then
+  echo "ERROR: PROJECT_PREFIX is required." >&2
+  echo "       AWS reserves every name starting with 'aws-' for itself" >&2
+  echo "       (SSM parameters, IAM entities, etc.), so an unprefixed" >&2
+  echo "       deploy will always fail with AccessDenied on the SSM" >&2
+  echo "       parameter and produces an 'aws-cost-reporter-*' namespace" >&2
+  echo "       that cannot be managed cleanly." >&2
+  echo "" >&2
+  echo "       Example:" >&2
+  echo "         PROJECT_PREFIX=treebo AWS_REGION=ap-south-1 ./scripts/deploy.sh" >&2
+  exit 1
 fi
+
+BUCKET="${PROJECT_PREFIX}-${PROJECT_NAME}"
 
 # ---------------------------------------------------------------------------
 # Bootstrap S3 bucket

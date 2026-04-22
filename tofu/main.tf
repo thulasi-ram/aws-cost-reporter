@@ -76,14 +76,18 @@ variable "log_retention_days" {
 }
 
 variable "project_prefix" {
-  description = "Org prefix prepended wherever AWS reserves the 'aws' namespace (e.g. SSM paths). Leave empty to use no prefix."
+  description = "Required org prefix prepended to every resource name. AWS reserves the 'aws' namespace (SSM parameters, IAM entities, etc.), so an unprefixed deploy fails."
   type        = string
-  default     = ""
+
+  validation {
+    condition     = length(var.project_prefix) > 0 && !startswith(lower(var.project_prefix), "aws")
+    error_message = "project_prefix must be set and must not start with 'aws' (AWS reserves that namespace). Example: -var=project_prefix=treebo"
+  }
 }
 
 locals {
   name      = "${var.project_name}-${var.environment}"
-  full_name = var.project_prefix != "" ? "${var.project_prefix}-${local.name}" : local.name
+  full_name = "${var.project_prefix}-${local.name}"
 }
 
 data "aws_caller_identity" "current" {}
