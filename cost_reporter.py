@@ -254,7 +254,15 @@ def build_cost_dataframe(start: date, end_exclusive: date) -> pl.DataFrame:
     if ec2_rows:
         df = df.filter(pl.col("service") != "EC2 - Other")
         df = pl.concat([df, to_polars(ec2_rows)])
-    return df
+    # Many usage_types collapse onto the same EC2-Other category, so concat
+    # leaves duplicate (date, account_id, service) rows. Aggregate here so
+    # downstream consumers (DynamoDB BatchWriteItem in particular) see a
+    # unique key per row.
+    return (
+        df.group_by(["date", "account_id", "service"])
+        .agg(pl.col("cost").sum())
+        .sort(["date", "account_id", "service"])
+    )
 
 
 # -----------------------------------------------------------------------------
