@@ -1,126 +1,145 @@
 # aws-cost-reporter
 
 Daily AWS cost report across an AWS Organization. Pulls from Cost Explorer in
-the payer account, renders per-account stacked-bar charts, writes a combined
-markdown report, persists daily history to DynamoDB, and posts a Slack summary
-at 09:00 IST.
+the payer account, persists a per-day slice to DynamoDB, writes a combined
+markdown report to S3, and posts a rich Slack Block Kit summary.
 
-**Status:** Phase 1–3 complete.
+No charts, no images — everything lives in the Slack message or the markdown
+report.
 
 ## Architecture
 
 ```
-EventBridge (03:30 UTC daily)
+EventBridge (03:30 UTC = 09:00 IST)
         │
         ▼
   Lambda (zip, python3.12)
         │
-        ├── Cost Explorer (payer account)   ← 1 call, 95 days, grouped by account+service
-        ├── Organizations.ListAccounts       ← human account names
-        ├── DynamoDB  (history + run marker)
-        ├── S3        (report.md + charts/*.png)
-        ├── SSM       (Slack webhook URL, SecureString)
-        └── Slack incoming webhook           ← Blocks payload + presigned S3 links
+        ├── Cost Explorer       ← 1 paginated call, 95 days, grouped by account+service
+        ├── Organizations       ← human account names
+        ├── DynamoDB            ← daily history + idempotency run marker
+        ├── S3                  ← markdown report (text only)
+        ├── SSM SecureString    ← Slack webhook URL
+        └── Slack webhook       ← Block Kit payload (org totals, insights, per-account)
 ```
 
-Everything is provisioned by OpenTofu (`tofu/`). The Lambda runs the same
-`cost_reporter.py` pipeline used locally.
+One shared S3 bucket holds everything, organised by prefix:
 
-## Phase 1 — local disk-only run
+```
+<project-prefix>-aws-cost-reporter-prod/
+├── tofu/
+│   └── terraform.tfstate
+├── lambda/
+│   └── function.zip
+└── reports/
+    └── YYYY-MM-DD/
+        └── report.md
+```
 
-Prerequisites:
+## Prerequisites
 
 - [uv](https://github.com/astral-sh/uv)
-- AWS credentials for the **payer / management** account with
-  `ce:GetCostAndUsage` and `organizations:ListAccounts`.
+- [OpenTofu](https://opentofu.org) 1.6+
+- `aws` CLI, authenticated as an identity with admin-ish rights in the payer
+  (management) account — Cost Explorer, Organizations, Lambda, S3, DynamoDB,
+  SSM, IAM, EventBridge, CloudWatch.
+- `zip` on `PATH` (standard on macOS and most Linux).
+- A Slack incoming webhook URL.
+
+## Local run (no AWS deploy needed)
 
 ```bash
 uv sync
 AWS_PROFILE=root uv run cost_reporter.py
 ```
 
-Output lands in `./report/` — open `report.md` (charts are in `./report/charts/`).
-
-Override the report day (defaults to T-2 UTC):
+Writes `./report/report.md`. Override the date:
 
 ```bash
 uv run cost_reporter.py --date 2026-04-01 --output-dir ./out
 ```
 
-## Phase 2 — Lambda zip + Slack delivery
+## Deploy
 
-`lambda_handler.py` is the Lambda entrypoint. It reuses the pipeline from
-`cost_reporter.py` and layers on the delivery glue:
-
-- S3 upload of `report.md` + chart PNGs → 7-day presigned URLs
-- DynamoDB history persistence for every (account, service, date) row
-- DynamoDB run marker per report date → re-invocations are no-ops
-- Slack Blocks payload posted via `urllib` (no `slack-sdk`)
-- On failure: short error posted to Slack and the Lambda re-raises so the
-  CloudWatch alarm fires
-
-`scripts/deploy.sh` builds the deployment zip locally: it `pip install`s the
-runtime deps (polars, matplotlib, seaborn, boto3) into `build/package/`
-using manylinux2014_x86_64 wheels for python 3.12, drops the two `.py`
-files next to them, and zips the result into `build/function.zip`. The
-zipped size lands around ~45 MiB — well under Lambda's 50 MiB direct-upload
-limit and 250 MiB unzipped limit.
-
-## Phase 3 — OpenTofu provisioning
-
-`tofu/` provisions everything:
-
-| Resource | Purpose |
-|---|---|
-| S3 bucket | Markdown reports + chart PNGs (400-day lifecycle, versioned, SSE-S3) |
-| DynamoDB | History + idempotency run markers (PAY_PER_REQUEST, PITR, 400-day TTL) |
-| SSM SecureString | Slack webhook URL (Tofu creates the shell; value set out-of-band) |
-| Lambda (zip, python3.12) | The reporter itself |
-| IAM role + policies | CE, Organizations, S3, DynamoDB, SSM read |
-| EventBridge rule | `cron(30 3 * * ? *)` = 09:00 IST daily |
-| CloudWatch log group | 30-day retention |
-| CloudWatch alarm | Fires on any Lambda error in a 24h window |
-
-### First-time deployment
-
-Tofu reads `build/function.zip` as the Lambda package, so the zip must
-exist before the first apply. `deploy.sh` builds it; on a fresh machine
-there's no Lambda yet so it just builds and exits.
+One command does everything — bucket bootstrap, build, tofu init, tofu apply:
 
 ```bash
-# 1. Build the deployment zip
-./scripts/deploy.sh
+PROJECT_PREFIX=treebo AWS_REGION=ap-south-1 ./scripts/deploy.sh
+```
 
-# 2. Apply everything
-cd tofu
-tofu init
-tofu apply
+- `PROJECT_PREFIX` (optional) — prepended to resource names wherever AWS
+  reserves the `aws` namespace (SSM parameter paths). Without it, the SSM
+  path would be `/aws-cost-reporter-prod/...` which hits
+  `No access to reserved parameter name`.
+- `AWS_REGION` (optional) — defaults to `us-east-1`. Flows through to both
+  the tofu S3 backend and the AWS provider, so the bucket and all resources
+  land in the same region.
 
-# 3. Set the real Slack webhook URL in SSM (Tofu left a placeholder)
+The script is idempotent — safe to re-run on every code or infra change.
+
+### First-time post-deploy
+
+Set the real Slack webhook (tofu leaves a placeholder so secrets stay out of
+git):
+
+```bash
 aws ssm put-parameter \
-  --name "$(tofu output -raw slack_webhook_ssm_parameter)" \
+  --name "$(cd tofu && tofu output -raw slack_webhook_ssm_parameter)" \
   --value "https://hooks.slack.com/services/T.../B.../..." \
   --type SecureString \
   --overwrite
 ```
 
+### What deploy.sh does, step by step
+
+1. Computes the bucket name: `{prefix}-aws-cost-reporter-prod` or
+   `aws-cost-reporter-prod` if no prefix.
+2. Creates the bucket if missing; applies encryption, versioning,
+   public-access-block, and a 400-day lifecycle rule on every run (all
+   idempotent `put-*` calls).
+3. Runs `./scripts/build.sh` (invoked via tofu `null_resource`):
+    - `uv export` → pinned `requirements.txt` from `uv.lock`
+    - `uv pip install --python-platform x86_64-manylinux_2_28 --python-version 3.12 --no-build`
+      downloads Linux wheels directly into `build/package/` — no venv
+      involved, no host-platform sdist fallback.
+    - Copies `cost_reporter.py` + `lambda_handler.py` into the package.
+    - Strips `tests/`, `__pycache__/`, `.pyi` to keep the zip lean.
+    - `zip`s to `build/function.zip`.
+4. `tofu init -reconfigure -backend-config=bucket=... -backend-config=region=...`
+   — backend bucket is passed at init because the state lives in the same
+   bucket (no chicken-and-egg).
+5. `tofu apply -var=region=... [-var=project_prefix=...]` creates everything
+   else.
+
 ### Subsequent deploys
 
-When you change the Python code, just rebuild the zip. `deploy.sh` detects
-the existing Lambda and calls `update-function-code` directly; Tofu
-doesn't need to run.
-
 ```bash
-./scripts/deploy.sh
+PROJECT_PREFIX=treebo AWS_REGION=ap-south-1 ./scripts/deploy.sh
 ```
 
-When you change `tofu/` HCL:
+The `source_hash` on `aws_s3_object.lambda_zip` is keyed off the source
+files (`cost_reporter.py`, `lambda_handler.py`, `uv.lock`, `build.sh`) — if
+none changed, tofu skips the upload.
 
-```bash
-cd tofu && tofu apply
-```
+## Resources
 
-### Manual invoke (local test against real resources)
+All provisioned by tofu except the S3 bucket:
+
+| Resource | Notes |
+|---|---|
+| S3 bucket | **Bootstrapped by `deploy.sh`** (not managed by tofu). Holds tofu state, the lambda zip, and markdown reports under distinct prefixes. |
+| `aws_s3_object.lambda_zip` | Uploads the zip. Keyed on source-file hashes to avoid plan/apply drift. |
+| DynamoDB | `(pk, sk)` table — history rows (`pk=account_id`, `sk=date#service`) and run markers (`pk="run"`, `sk=date`). PAY_PER_REQUEST, PITR, 400-day TTL. |
+| SSM SecureString | Slack webhook. Tofu sets a placeholder, `ignore_changes = [value]` so your real value survives. |
+| Lambda (zip, python3.12) | Reads from S3. |
+| IAM role + inline policy | CE, Organizations, S3, DynamoDB, SSM. |
+| EventBridge rule | `cron(30 3 * * ? *)` — daily 03:30 UTC / 09:00 IST. |
+| CloudWatch log group | 30-day retention. |
+| CloudWatch alarm | Fires on ≥1 Lambda error in a 24 h window. |
+
+## Operate
+
+### Manual invoke (real AWS, real Slack)
 
 ```bash
 aws lambda invoke \
@@ -130,7 +149,7 @@ aws lambda invoke \
   /tmp/out.json && cat /tmp/out.json
 ```
 
-Override the report date for ad-hoc runs:
+Override the report date (useful for backfills):
 
 ```bash
 aws lambda invoke \
@@ -140,34 +159,84 @@ aws lambda invoke \
   /tmp/out.json
 ```
 
-The run marker guards against double-posting: if a date has already been
-reported successfully, re-invocations return `{"status":"skipped"}`. Delete
-the marker in DynamoDB (`pk="run"`, `sk="2026-04-01"`) to force a re-run.
+Re-invocations on a date already reported return `{"status":"skipped"}`.
+Delete the DynamoDB item (`pk="run"`, `sk="2026-04-01"`) to force a re-run.
 
-### Tail the Lambda logs
+### Tail logs
 
 ```bash
 aws logs tail "$(cd tofu && tofu output -raw cloudwatch_log_group)" --follow
 ```
 
-## What the report contains
+## What the Slack message contains
 
-- One Cost Explorer call per run: 95 days of `AmortizedCost`, grouped by
-  `LINKED_ACCOUNT` + `SERVICE`, daily granularity.
-- Filters out `Tax`, `Refund`, `Credit` record types.
-- Excludes monthly lump services (AWS Support Developer/Business/Enterprise)
-  from the daily view so they don't skew averages or trigger false
-  Appeared/Disappeared insights.
-- Default report day is **T-2 UTC** (the last finalized CE day).
-- **Merged insights** at the top of the report, grouped by account, with
-  quiet accounts skipped. Rules: DoD jumps, anomalies vs 30d baseline,
-  services appeared / disappeared vs T-30..T-1 historical window, and an
-  EC2-Other callout.
-- Per account: stacked bar chart (Yesterday / 30d avg / 90d avg, top 10
-  services + Other) with total dollar labels on top of each bar, and a
-  top-15 service table including `% of day` and day-over-day deltas.
-- Consistent service colours across all account charts (hand-picked
-  Carto Bold + Prism strong categorical palette).
+- **Header** with the report date and environment.
+- **Org totals** as a 4-field block: org total, DoD, 30d avg, vs 30d.
+- **Insights** merged across all accounts — quiet accounts are skipped.
+  Rules: DoD jumps (≥30 % and ≥$5), anomalies vs 30d baseline (≥2× and
+  ≥$5), services appeared/disappeared vs the previous 30d, and an
+  EC2-Other breakdown (EBS / data transfer / misc).
+- **Per-account sections**: header line with yesterday / 30d / 90d / DoD,
+  followed by the top-5 services for that account with DoD arrows.
+- **Full report button** linking to the markdown in S3 (presigned URL, 7 d).
 
-All tunables live at the top of `cost_reporter.py` — lookback window, top-N
-sizes, insight thresholds, the monthly-lump service list, and the palette.
+## What the markdown report contains
+
+Everything in Slack plus a full per-account table of the top-15 services
+with yesterday / day-before / 30d avg / 90d avg / % of day / Δ DoD / Δ vs
+30d. Lives at `reports/{date}/report.md` in the bucket.
+
+## Configuration
+
+All tunables live at the top of `cost_reporter.py`:
+
+- `LOOKBACK_DAYS = 95` — covers the 90-day avg plus buffer.
+- `TOP_N_TABLE = 15` — services per account in the markdown table.
+- `TOP_N_SLACK = 5` — services per account in the Slack block.
+- `EXCLUDED_RECORD_TYPES = ["Tax", "Refund", "Credit"]`
+- `MONTHLY_LUMP_SERVICES` — AWS Support tiers excluded from the daily view
+  because AmortizedCost doesn't smooth them and they create false
+  Appeared/Disappeared alerts.
+- Insight thresholds (`DOD_PCT_THRESHOLD`, `ANOMALY_MULTIPLIER`, etc.).
+
+Schedule lives in `tofu/main.tf` as `var.schedule_expression`:
+
+```hcl
+variable "schedule_expression" {
+  default = "cron(30 3 * * ? *)"  # 03:30 UTC = 09:00 IST
+}
+```
+
+## Design notes
+
+**Why zip, not a container image.** Container images have a 10 GB cap but
+add ECR, image tagging, and cold-start weight. A trimmed zip with
+cross-platform wheels is smaller, simpler, and quicker to deploy.
+
+**Why Block Kit, not charts.** matplotlib + seaborn + pandas + numpy +
+pillow pushed the unzipped package over Lambda's 250 MB limit and
+dominated cold-start import time. Slack Block Kit renders totals, fields,
+and trend arrows natively — no images required, and the message stays
+scannable without leaving Slack.
+
+**Why one bucket.** State, the lambda zip, and reports all live together
+under different prefixes. Avoids managing a separate state bucket, and
+sidesteps the chicken-and-egg of storing tofu state in a tofu-managed
+bucket: the bucket is bootstrapped by `deploy.sh` and intentionally not a
+tofu resource.
+
+**Why `PROJECT_PREFIX`.** AWS reserves parameter paths starting with `aws`,
+so `/aws-cost-reporter-prod/slack-webhook-url` is rejected. The prefix
+prepends to `local.full_name` wherever it matters (SSM, etc.) so the
+project works inside orgs with that constraint.
+
+**Why `x86_64-manylinux_2_28`.** Lambda Python 3.12 runs on Amazon Linux
+2023 (glibc 2.34). Newer packages (numpy, contourpy) stopped shipping
+`manylinux2014` wheels, so we target a modern glibc baseline that Lambda
+satisfies.
+
+**Why `uv pip install --no-build`.** Without it, uv falls back to building
+sdists from source for the host platform (macOS arm64) when it can't find
+a matching wheel — which then fails with "wheel not compatible with
+target". `--no-build` surfaces the real problem (missing wheel) instead of
+hiding it behind a broken build.
