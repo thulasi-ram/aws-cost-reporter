@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""AWS Cost Reporter — Phase 1 (local, disk-only).
+"""AWS Cost Reporter.
 
 Pulls daily cost data from Cost Explorer for all accounts under an AWS
 Organization (from the payer account), computes daily/monthly/quarterly
-comparisons per account, renders per-account stacked-bar charts, and writes
-a combined markdown report to disk.
+comparisons per account, and writes a combined markdown report to disk.
 
 Run:
     uv sync
@@ -22,51 +21,14 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
-import matplotlib
-
-matplotlib.use("Agg")  # headless — must be set before pyplot import
-import matplotlib.pyplot as plt  # noqa: E402
-import polars as pl  # noqa: E402
-import seaborn as sns  # noqa: E402
-
-# Module-level chart theme — one place to own the aesthetic.
-sns.set_theme(style="white", context="notebook")
-matplotlib.rcParams.update(
-    {
-        "font.family": "sans-serif",
-        "font.sans-serif": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"],
-        "axes.titlesize": 15,
-        "axes.titleweight": "semibold",
-        "axes.titlepad": 14,
-        "axes.titlecolor": "#222222",
-        "axes.labelsize": 11,
-        "axes.labelcolor": "#3a3a3a",
-        "axes.edgecolor": "#cccccc",
-        "axes.linewidth": 0.8,
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "axes.grid": True,
-        "axes.axisbelow": True,
-        "xtick.color": "#555555",
-        "ytick.color": "#555555",
-        "xtick.labelsize": 11,
-        "ytick.labelsize": 10,
-        "legend.frameon": False,
-        "legend.fontsize": 9,
-        "grid.color": "#eeeeee",
-        "grid.linewidth": 0.8,
-        "figure.facecolor": "white",
-        "savefig.facecolor": "white",
-        "savefig.dpi": 140,
-    }
-)
+import polars as pl
 
 # -----------------------------------------------------------------------------
 # Config (tweak freely — kept at top for visibility)
 # -----------------------------------------------------------------------------
 LOOKBACK_DAYS = 95              # covers 90-day avg + small buffer
-TOP_N_CHART = 10                # services shown in the per-account chart
 TOP_N_TABLE = 15                # services shown in the per-account table
+TOP_N_SLACK = 5                 # services shown in the per-account Slack block
 EXCLUDED_RECORD_TYPES = ["Tax", "Refund", "Credit"]
 CE_REGION = "us-east-1"         # Cost Explorer is served from us-east-1
 
@@ -80,19 +42,6 @@ MONTHLY_LUMP_SERVICES = {
     "AWS Support (Business)",
     "AWS Support (Enterprise)",
 }
-
-# Hand-picked strong categorical palette — Carto "Bold" extended with "Prism".
-# Designed for categorical data (high saturation, distinguishable hues). No
-# extra dependency, just good design choices. Cycles if the org's top-N cross
-# the palette size.
-STRONG_PALETTE = [
-    "#7F3C8D", "#11A579", "#3969AC", "#F2B701", "#E73F74",
-    "#80BA5A", "#E68310", "#008695", "#CF1C90", "#F97B72",
-    "#4B4B8F", "#A5AA99",
-    "#1D6996", "#38A6A5", "#0F8554", "#73AF48",
-    "#EDAD08", "#E17C05", "#CC503E", "#94346E",
-]
-OTHER_COLOR = "#BDBDBD"
 
 # Insights thresholds
 DOD_PCT_THRESHOLD = 30.0        # flag DoD moves larger than this %
@@ -117,11 +66,11 @@ def setup_logging() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="AWS Cost Reporter (Phase 1, disk-only)")
+    p = argparse.ArgumentParser(description="AWS Cost Reporter")
     p.add_argument(
         "--output-dir",
         default=os.environ.get("OUTPUT_DIR", "./report"),
-        help="Where to write report.md and charts/ (default: ./report)",
+        help="Where to write report.md (default: ./report)",
     )
     p.add_argument(
         "--date",
@@ -476,153 +425,24 @@ def build_insights(summary: AccountSummary) -> list[str]:
 
 
 # -----------------------------------------------------------------------------
-# Chart rendering
-# -----------------------------------------------------------------------------
-def build_service_palette(summaries: list[AccountSummary]) -> dict[str, str]:
-    """Assign a stable color per service across all accounts.
-
-    Any service that appears in *any* account's top-N chart slot gets a color
-    from STRONG_PALETTE, ordered by descending total yesterday spend so the
-    biggest services land on the first (most distinct) slots. The palette
-    cycles if there are more services than slots. 'Other' is a fixed gray.
-    """
-    totals: dict[str, float] = {}
-    for s in summaries:
-        for row in s.services.head(TOP_N_CHART).iter_rows(named=True):
-            totals[row["service"]] = (
-                totals.get(row["service"], 0.0) + row["yesterday"]
-            )
-    ranked = sorted(totals.keys(), key=lambda k: -totals[k])
-    color_map: dict[str, str] = {
-        svc: STRONG_PALETTE[i % len(STRONG_PALETTE)]
-        for i, svc in enumerate(ranked)
-    }
-    color_map["Other"] = OTHER_COLOR
-    return color_map
-
-
-def render_chart(
-    summary: AccountSummary,
-    charts_dir: Path,
-    color_map: dict[str, str],
-) -> Path:
-    """Render a stacked bar: 3 bars (Yesterday / 30d avg / 90d avg).
-
-    Stack segments are the top-N services by yesterday cost, plus "Other".
-    """
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    path = charts_dir / f"{summary.account_id}.png"
-
-    if summary.services.is_empty() or summary.total_yesterday == 0:
-        fig, ax = plt.subplots(figsize=(10, 3.5))
-        ax.text(
-            0.5,
-            0.5,
-            f"No cost data for {summary.account_name}",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-            color="#888888",
-            fontsize=12,
-        )
-        ax.set_axis_off()
-        fig.savefig(path)
-        plt.close(fig)
-        return path
-
-    # Only the columns we actually plot — keeps schema alignment simple.
-    chart_cols = ["service", "yesterday", "avg_30d", "avg_90d"]
-    top = summary.services.head(TOP_N_CHART).select(chart_cols)
-    rest = summary.services.slice(TOP_N_CHART)
-    if rest.height > 0:
-        other_df = pl.DataFrame(
-            {
-                "service": ["Other"],
-                "yesterday": [float(rest["yesterday"].sum())],
-                "avg_30d": [float(rest["avg_30d"].sum())],
-                "avg_90d": [float(rest["avg_90d"].sum())],
-            }
-        )
-        chart_df = pl.concat([top, other_df])
-    else:
-        chart_df = top
-
-    categories = ["Yesterday", "30d avg", "90d avg"]
-    value_cols = ["yesterday", "avg_30d", "avg_90d"]
-
-    fig, ax = plt.subplots(figsize=(11, 6.5))
-    bottoms = [0.0, 0.0, 0.0]
-    for row in chart_df.iter_rows(named=True):
-        svc = row["service"]
-        heights = [row[c] for c in value_cols]
-        ax.bar(
-            categories,
-            heights,
-            bottom=bottoms,
-            color=color_map.get(svc, "#999999"),
-            label=svc,
-            width=0.55,
-            edgecolor="white",
-            linewidth=0.8,
-        )
-        bottoms = [b + h for b, h in zip(bottoms, heights)]
-
-    # Total label on top of each bar — makes the chart scannable without
-    # squinting at the y-axis.
-    max_total = max(bottoms) if bottoms else 0
-    offset = max_total * 0.015
-    for i, total in enumerate(bottoms):
-        ax.text(
-            i,
-            total + offset,
-            f"${total:,.0f}",
-            ha="center",
-            va="bottom",
-            fontsize=11,
-            fontweight="semibold",
-            color="#222222",
-        )
-
-    ax.set_ylabel("USD")
-    ax.set_ylim(0, max_total * 1.12 if max_total > 0 else 1)
-    ax.set_title(
-        f"{summary.account_name}  ·  {summary.account_id}  ·  "
-        f"{summary.report_date} UTC",
-        loc="left",
-    )
-    ax.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda x, _: f"${x:,.0f}")
-    )
-    ax.legend(
-        bbox_to_anchor=(1.02, 1),
-        loc="upper left",
-        borderaxespad=0,
-        handlelength=1.2,
-        handleheight=1.2,
-    )
-    fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
-    return path
-
-
-# -----------------------------------------------------------------------------
 # Report writing
 # -----------------------------------------------------------------------------
-def _fmt_usd(x: float) -> str:
+def fmt_usd(x: float) -> str:
     return f"${x:,.2f}"
 
 
-def _fmt_delta_pct(a: float, b: float) -> str:
+def fmt_delta_pct(a: float, b: float, *, arrow: bool = False) -> str:
     if b == 0:
         return "—"
-    return f"{(a - b) / b * 100:+.1f}%"
+    pct = (a - b) / b * 100
+    if arrow:
+        return f"{'↑' if pct > 0 else '↓'}{abs(pct):.1f}%"
+    return f"{pct:+.1f}%"
 
 
 def write_report(
     summaries: list[AccountSummary],
     insights: dict[str, list[str]],
-    chart_paths: dict[str, Path],
     report_date: date,
     out_dir: Path,
 ) -> Path:
@@ -665,11 +485,11 @@ def write_report(
     for s in summaries:
         lines.append(
             f"| {s.account_name} (`{s.account_id}`) "
-            f"| {_fmt_usd(s.total_yesterday)} "
-            f"| {_fmt_usd(s.total_day_before)} "
-            f"| {_fmt_usd(s.total_avg_30d)} "
-            f"| {_fmt_usd(s.total_avg_90d)} "
-            f"| {_fmt_delta_pct(s.total_yesterday, s.total_day_before)} |"
+            f"| {fmt_usd(s.total_yesterday)} "
+            f"| {fmt_usd(s.total_day_before)} "
+            f"| {fmt_usd(s.total_avg_30d)} "
+            f"| {fmt_usd(s.total_avg_90d)} "
+            f"| {fmt_delta_pct(s.total_yesterday, s.total_day_before)} |"
         )
     grand_y = sum(s.total_yesterday for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
@@ -677,11 +497,11 @@ def write_report(
     grand_90 = sum(s.total_avg_90d for s in summaries)
     lines.append(
         f"| **TOTAL** "
-        f"| **{_fmt_usd(grand_y)}** "
-        f"| **{_fmt_usd(grand_p)}** "
-        f"| **{_fmt_usd(grand_30)}** "
-        f"| **{_fmt_usd(grand_90)}** "
-        f"| **{_fmt_delta_pct(grand_y, grand_p)}** |"
+        f"| **{fmt_usd(grand_y)}** "
+        f"| **{fmt_usd(grand_p)}** "
+        f"| **{fmt_usd(grand_30)}** "
+        f"| **{fmt_usd(grand_90)}** "
+        f"| **{fmt_delta_pct(grand_y, grand_p)}** |"
     )
     lines.append("")
 
@@ -689,15 +509,12 @@ def write_report(
     for s in summaries:
         lines.append(f"## {s.account_name} (`{s.account_id}`)")
         lines.append("")
-        rel_chart = chart_paths[s.account_id].relative_to(out_dir)
-        lines.append(f"![chart]({rel_chart})")
-        lines.append("")
         lines.append(
-            f"**Day:** {_fmt_usd(s.total_yesterday)}  "
-            f"**Day Before:** {_fmt_usd(s.total_day_before)}  "
-            f"**30d Avg:** {_fmt_usd(s.total_avg_30d)}  "
-            f"**90d Avg:** {_fmt_usd(s.total_avg_90d)}  "
-            f"**DoD:** {_fmt_delta_pct(s.total_yesterday, s.total_day_before)}"
+            f"**Day:** {fmt_usd(s.total_yesterday)}  "
+            f"**Day Before:** {fmt_usd(s.total_day_before)}  "
+            f"**30d Avg:** {fmt_usd(s.total_avg_30d)}  "
+            f"**90d Avg:** {fmt_usd(s.total_avg_90d)}  "
+            f"**DoD:** {fmt_delta_pct(s.total_yesterday, s.total_day_before)}"
         )
         lines.append("")
         lines.append(
@@ -714,13 +531,13 @@ def write_report(
             )
             lines.append(
                 f"| {i} | {row['service']} "
-                f"| {_fmt_usd(row['yesterday'])} "
-                f"| {_fmt_usd(row['day_before'])} "
-                f"| {_fmt_usd(row['avg_30d'])} "
-                f"| {_fmt_usd(row['avg_90d'])} "
+                f"| {fmt_usd(row['yesterday'])} "
+                f"| {fmt_usd(row['day_before'])} "
+                f"| {fmt_usd(row['avg_30d'])} "
+                f"| {fmt_usd(row['avg_90d'])} "
                 f"| {pct_of_day} "
-                f"| {_fmt_delta_pct(row['yesterday'], row['day_before'])} "
-                f"| {_fmt_delta_pct(row['yesterday'], row['avg_30d'])} |"
+                f"| {fmt_delta_pct(row['yesterday'], row['day_before'])} "
+                f"| {fmt_delta_pct(row['yesterday'], row['avg_30d'])} |"
             )
         lines.append("")
 
@@ -737,7 +554,6 @@ def main() -> int:
     args = parse_args()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    charts_dir = out_dir / "charts"
 
     rpt_date = resolve_report_day(args.date)
     start = rpt_date - timedelta(days=LOOKBACK_DAYS - 1)
@@ -747,7 +563,6 @@ def main() -> int:
     accounts = fetch_account_map()
     df = build_cost_dataframe(start, end_exclusive)
 
-    # Pass 1: build every account summary so we can derive a stable palette
     summaries: list[AccountSummary] = []
     insights: dict[str, list[str]] = {}
     for acct_id in sorted(accounts):
@@ -757,16 +572,9 @@ def main() -> int:
         summaries.append(summary)
         insights[acct_id] = build_insights(summary)
 
-    # Pass 2: render charts with a palette that is consistent across accounts
-    color_map = build_service_palette(summaries)
-    chart_paths: dict[str, Path] = {
-        s.account_id: render_chart(s, charts_dir, color_map) for s in summaries
-    }
-
-    # Sort report sections by yesterday cost desc (biggest spenders first)
     summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
 
-    report_path = write_report(summaries, insights, chart_paths, rpt_date, out_dir)
+    report_path = write_report(summaries, insights, rpt_date, out_dir)
     logger.info("Wrote %s", report_path)
     return 0
 

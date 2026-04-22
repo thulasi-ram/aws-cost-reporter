@@ -4,8 +4,8 @@ output "lambda_function_name" {
 }
 
 output "s3_bucket_name" {
-  description = "Bucket holding markdown reports and chart PNGs"
-  value       = aws_s3_bucket.reports.id
+  description = "Bucket holding tofu state, lambda zip, and markdown reports"
+  value       = local.full_name
 }
 
 output "dynamodb_table_name" {

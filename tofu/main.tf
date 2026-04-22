@@ -1,5 +1,14 @@
 terraform {
   required_version = ">= 1.6"
+
+  backend "s3" {
+    # bucket is supplied at init time so it can follow full_name (prefix + project name).
+    # tofu init -backend-config="bucket=treebo-aws-cost-reporter-prod"
+    key     = "tofu/terraform.tfstate"
+    region  = "us-east-1"
+    encrypt = true
+  }
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -66,8 +75,15 @@ variable "log_retention_days" {
   default     = 30
 }
 
+variable "project_prefix" {
+  description = "Org prefix prepended wherever AWS reserves the 'aws' namespace (e.g. SSM paths). Leave empty to use no prefix."
+  type        = string
+  default     = ""
+}
+
 locals {
-  name = "${var.project_name}-${var.environment}"
+  name      = "${var.project_name}-${var.environment}"
+  full_name = var.project_prefix != "" ? "${var.project_prefix}-${local.name}" : local.name
 }
 
 data "aws_caller_identity" "current" {}

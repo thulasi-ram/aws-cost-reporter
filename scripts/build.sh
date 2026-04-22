@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Build build/function.zip for Lambda deployment.
 #
-# Uses uv export to get exact pinned versions from uv.lock (no re-resolution),
-# then installs manylinux wheels for Lambda. The project itself is installed
-# via the hatchling build system — no manual file copying.
+# Pure uv pipeline:
+#   1. uv export       — pinned deps from uv.lock (no re-resolution)
+#   2. uv pip install  — download Linux wheels to a flat target directory
+#                        (uses --python-platform for cross-platform wheels)
+#   3. uv pip install  — add the project's own modules via hatchling
+#   4. python3 zip     — pack everything into function.zip
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -20,29 +23,31 @@ echo "==> Exporting pinned deps from uv.lock"
 uv export --no-dev --no-emit-project --format requirements-txt \
   > "${BUILD_DIR}/requirements.txt"
 
-echo "==> Installing runtime deps (manylinux2014_x86_64, py3.12, no-compile)"
-uv pip install \
-  --no-compile \
+# VIRTUAL_ENV="" keeps uv from trying to resolve against the active venv —
+# we want a standalone cross-platform resolve.
+echo "==> Installing runtime deps (x86_64-manylinux_2_28, py3.12)"
+# Lambda Python 3.12 runs on Amazon Linux 2023 (glibc 2.34), so manylinux_2_28
+# wheels are safe. Some newer packages (contourpy, numpy) no longer ship the
+# older manylinux2014 tag.
+VIRTUAL_ENV="" uv pip install \
   --target "${PKG_DIR}" \
-  --platform manylinux2014_x86_64 \
+  --python-platform x86_64-manylinux_2_28 \
   --python-version 3.12 \
-  --implementation cp \
-  --only-binary=:all: \
+  --no-build \
   -r "${BUILD_DIR}/requirements.txt"
 
-echo "==> Installing project modules via build system"
-uv pip install --no-compile --no-deps --target "${PKG_DIR}" .
+echo "==> Copying project modules"
+cp cost_reporter.py lambda_handler.py "${PKG_DIR}/"
+
+# Strip things Lambda never needs.
+echo "==> Trimming package"
+find "${PKG_DIR}" -type d \( -name "__pycache__" -o -name "tests" -o -name "test" \) \
+  -exec rm -rf {} + 2>/dev/null || true
+find "${PKG_DIR}" -type f \( -name "*.pyc" -o -name "*.pyi" \) \
+  -delete 2>/dev/null || true
 
 echo "==> Writing ${ZIP_PATH}"
-python3 - <<PY
-import os, zipfile
-pkg = "${PKG_DIR}"
-out = "${ZIP_PATH}"
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-    for root, _, files in os.walk(pkg):
-        for f in files:
-            full = os.path.join(root, f)
-            arc = os.path.relpath(full, pkg)
-            zf.write(full, arc)
-print(f"  zip size: {os.path.getsize(out) / (1024*1024):.1f} MiB")
-PY
+(cd "${PKG_DIR}" && zip -qr - .) > "${ZIP_PATH}"
+printf "  zip size: %s (unpacked: %s)\n" \
+  "$(du -h "${ZIP_PATH}" | cut -f1)" \
+  "$(du -sh "${PKG_DIR}" | cut -f1)"

@@ -1,19 +1,19 @@
-"""AWS Lambda entrypoint for the cost reporter (Phase 2).
+"""AWS Lambda entrypoint for the cost reporter.
 
 Procedural flow:
   1. Read config from environment (set by the Tofu-provisioned Lambda)
   2. Resolve the Slack webhook URL from SSM
   3. Idempotency check: skip if this report day already succeeded
-  4. Run the shared pipeline from cost_reporter.py (CE -> polars -> charts + md)
+  4. Run the shared pipeline from cost_reporter.py (CE -> polars -> markdown)
   5. Persist the report-day slice to DynamoDB (history + future trend queries)
-  6. Upload markdown + charts to S3, generate presigned URLs (7 days)
-  7. Post a Slack Blocks message via urllib (no slack-sdk)
+  6. Upload markdown report to S3, generate a presigned URL (7 days)
+  7. Post a Slack Block Kit message (rich tables, no images) via urllib
   8. Write the run marker to DynamoDB so re-invocations are no-ops
   9. On any failure, post a short Slack error and re-raise so the CloudWatch
      alarm fires.
 
 Required environment variables:
-    S3_BUCKET                — bucket for charts + markdown report
+    S3_BUCKET                — bucket for the markdown report
     DYNAMODB_TABLE           — table for history + run markers
     SLACK_WEBHOOK_SSM_PARAM  — SSM parameter name holding the webhook URL
 Optional:
@@ -24,6 +24,7 @@ Optional:
 import json
 import logging
 import os
+import shutil
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -36,13 +37,14 @@ import polars as pl
 
 from cost_reporter import (
     LOOKBACK_DAYS,
+    TOP_N_SLACK,
     AccountSummary,
     build_account_summary,
     build_cost_dataframe,
     build_insights,
-    build_service_palette,
     fetch_account_map,
-    render_chart,
+    fmt_delta_pct,
+    fmt_usd,
     resolve_report_day,
     write_report,
 )
@@ -166,12 +168,22 @@ def _presign(bucket: str, key: str, ttl_seconds: int) -> str:
 # -----------------------------------------------------------------------------
 # Slack formatting + POST
 # -----------------------------------------------------------------------------
+# Slack hard limits: 2900 chars/section, 50 blocks/message.
+_SECTION_LIMIT = 2900
+_MAX_BLOCKS = 50
+DIVIDER = {"type": "divider"}
+
+
+def _mrkdwn(text: str) -> dict:
+    return {"type": "mrkdwn", "text": text}
+
+
+def _section(text: str) -> dict:
+    return {"type": "section", "text": _mrkdwn(text[:_SECTION_LIMIT])}
+
+
 def _dod(a: float, b: float) -> str:
-    if b == 0:
-        return "—"
-    pct = (a - b) / b * 100
-    arrow = "↑" if pct > 0 else "↓"
-    return f"{arrow}{abs(pct):.1f}%"
+    return fmt_delta_pct(a, b, arrow=True)
 
 
 def _slack_payload(
@@ -179,14 +191,8 @@ def _slack_payload(
     insights: dict[str, list[str]],
     report_date: date,
     report_url: str,
-    chart_urls: dict[str, str],
     environment: str,
 ) -> dict:
-    """Build a Slack Blocks payload that fits inside the incoming-webhook limits.
-
-    Slack caps each section text at 3000 chars and the total message at 50
-    blocks, so we truncate defensively.
-    """
     title = f"AWS Cost Report — {report_date} (UTC)"
     if environment and environment != "prod":
         title += f" [{environment}]"
@@ -196,79 +202,63 @@ def _slack_payload(
         {
             "type": "context",
             "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        "_AmortizedCost. Excludes Tax/Refund/Credit and "
-                        "monthly lump services (AWS Support)._"
-                    ),
-                }
+                _mrkdwn(
+                    "_AmortizedCost. Excludes Tax/Refund/Credit and "
+                    "monthly lump services (AWS Support)._"
+                )
             ],
         },
-        {"type": "divider"},
+        DIVIDER,
     ]
 
-    # Insights section — merged across accounts, quiet accounts skipped
-    noisy = [s for s in summaries if insights.get(s.account_id)]
-    if noisy:
-        insight_lines = ["*Insights*"]
-        for s in noisy:
-            insight_lines.append(f"*{s.account_name}*")
-            for note in insights[s.account_id][:6]:
-                insight_lines.append(f"• {note}")
-        blocks.append(
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": "\n".join(insight_lines)[:2900]},
-            }
-        )
-    else:
-        blocks.append(
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "*Insights*\n_Nothing unusual across any account today._",
-                },
-            }
-        )
-    blocks.append({"type": "divider"})
-
-    # Summary across accounts (compact one-line-per-account format)
-    summary_lines = ["*Summary* _(Yesterday · 30d avg · 90d avg · Δ DoD)_"]
-    for s in summaries:
-        summary_lines.append(
-            f"• `{s.account_name}`  "
-            f"${s.total_yesterday:,.2f}  ·  "
-            f"${s.total_avg_30d:,.2f}  ·  "
-            f"${s.total_avg_90d:,.2f}  ·  "
-            f"{_dod(s.total_yesterday, s.total_day_before)}"
-        )
     grand_y = sum(s.total_yesterday for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
-    summary_lines.append(
-        f"*Total*: ${grand_y:,.2f}  ({_dod(grand_y, grand_p)} DoD)"
-    )
+    grand_30 = sum(s.total_avg_30d for s in summaries)
+    totals_fields = [
+        ("Org total", fmt_usd(grand_y)),
+        ("DoD", f"{_dod(grand_y, grand_p)}  _({fmt_usd(grand_p)})_"),
+        ("30d avg", fmt_usd(grand_30)),
+        ("vs 30d", _dod(grand_y, grand_30)),
+    ]
     blocks.append(
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": "\n".join(summary_lines)[:2900]},
+            "fields": [_mrkdwn(f"*{k}*\n{v}") for k, v in totals_fields],
         }
     )
+    blocks.append(DIVIDER)
 
-    # Chart links (one per account)
-    if chart_urls:
-        chart_lines = ["*Charts*"]
-        for s in summaries:
-            url = chart_urls.get(s.account_id)
-            if url:
-                chart_lines.append(f"• <{url}|{s.account_name}>")
+    noisy = [s for s in summaries if insights.get(s.account_id)]
+    if noisy:
+        lines = ["*Insights*"]
+        for s in noisy:
+            lines.append(f"*{s.account_name}*")
+            for note in insights[s.account_id][:6]:
+                lines.append(f"• {note}")
+        blocks.append(_section("\n".join(lines)))
+    else:
         blocks.append(
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": "\n".join(chart_lines)[:2900]},
-            }
+            _section("*Insights*\n_Nothing unusual across any account today._")
         )
+    blocks.append(DIVIDER)
+
+    blocks.append(_section("*By account*"))
+    for s in summaries:
+        header = (
+            f"*{s.account_name}*  `{s.account_id}`\n"
+            f"{fmt_usd(s.total_yesterday)}  ·  "
+            f"30d {fmt_usd(s.total_avg_30d)}  ·  "
+            f"90d {fmt_usd(s.total_avg_90d)}  ·  "
+            f"DoD {_dod(s.total_yesterday, s.total_day_before)}"
+        )
+        svc_lines = [
+            f"  • {row['service']}  "
+            f"{fmt_usd(row['yesterday'])}  "
+            f"({_dod(row['yesterday'], row['day_before'])})"
+            for row in s.services.head(TOP_N_SLACK).iter_rows(named=True)
+        ]
+        text = header + ("\n" + "\n".join(svc_lines) if svc_lines else "")
+        blocks.append(_section(text))
 
     blocks.append(
         {
@@ -283,7 +273,7 @@ def _slack_payload(
         }
     )
 
-    return {"blocks": blocks}
+    return {"blocks": blocks[:_MAX_BLOCKS]}
 
 
 def _post_slack(webhook_url: str, payload: dict) -> None:
@@ -313,13 +303,7 @@ def _post_slack_error(webhook_url: str, err: Exception, report_date: date) -> No
                         "text": f"AWS cost report failed ({report_date})",
                     },
                 },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"```{type(err).__name__}: {err}```",
-                    },
-                },
+                _section(f"```{type(err).__name__}: {err}```"),
             ]
         }
         _post_slack(webhook_url, payload)
@@ -348,15 +332,11 @@ def handler(event: dict, context: object) -> dict:
 
         # Lambda's only writable location is /tmp. Wipe it per invocation so
         # warm containers don't leak artifacts between runs.
+        # Lambda's only writable location is /tmp. Wipe per-invocation so warm
+        # containers don't leak artifacts between runs.
         out_dir = Path("/tmp/report")
-        if out_dir.exists():
-            for p in sorted(out_dir.rglob("*"), reverse=True):
-                if p.is_file():
-                    p.unlink()
-                elif p.is_dir():
-                    p.rmdir()
+        shutil.rmtree(out_dir, ignore_errors=True)
         out_dir.mkdir(parents=True, exist_ok=True)
-        charts_dir = out_dir / "charts"
 
         # --- Shared pipeline (same functions the CLI uses) ---
         start = report_date - timedelta(days=LOOKBACK_DAYS - 1)
@@ -378,34 +358,21 @@ def handler(event: dict, context: object) -> dict:
             summaries.append(s)
             insights[acct_id] = build_insights(s)
 
-        color_map = build_service_palette(summaries)
-        chart_paths = {
-            s.account_id: render_chart(s, charts_dir, color_map) for s in summaries
-        }
         summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
-        report_path = write_report(
-            summaries, insights, chart_paths, report_date, out_dir
-        )
+        report_path = write_report(summaries, insights, report_date, out_dir)
 
         # --- Persist raw data to DynamoDB (unfiltered: includes lump services) ---
         _persist_history(cfg["ddb_table"], df, report_date)
 
-        # --- Upload artifacts to S3 and presign ---
-        date_prefix = f"reports/{report_date.isoformat()}"
-        report_key = f"{date_prefix}/report.md"
+        # --- Upload markdown report to S3 and presign ---
+        report_key = f"reports/{report_date.isoformat()}/report.md"
         _upload_artifact(cfg["s3_bucket"], report_key, report_path, "text/markdown")
-
-        chart_urls: dict[str, str] = {}
         ttl_seconds = cfg["ttl_days"] * 24 * 3600
-        for acct_id, path in chart_paths.items():
-            key = f"{date_prefix}/charts/{path.name}"
-            _upload_artifact(cfg["s3_bucket"], key, path, "image/png")
-            chart_urls[acct_id] = _presign(cfg["s3_bucket"], key, ttl_seconds)
         report_url = _presign(cfg["s3_bucket"], report_key, ttl_seconds)
 
         # --- Post to Slack ---
         payload = _slack_payload(
-            summaries, insights, report_date, report_url, chart_urls, cfg["environment"]
+            summaries, insights, report_date, report_url, cfg["environment"]
         )
         _post_slack(webhook_url, payload)
 

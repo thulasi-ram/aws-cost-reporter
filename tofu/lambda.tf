@@ -2,7 +2,7 @@
 # IAM execution role
 # ---------------------------------------------------------------------------
 resource "aws_iam_role" "lambda" {
-  name = "${local.name}-exec"
+  name = "${local.full_name}-exec"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -20,7 +20,7 @@ resource "aws_iam_role_policy_attachment" "basic" {
 }
 
 resource "aws_iam_role_policy" "runtime" {
-  name = "${local.name}-runtime"
+  name = "${local.full_name}-runtime"
   role = aws_iam_role.lambda.id
 
   policy = jsonencode({
@@ -42,7 +42,7 @@ resource "aws_iam_role_policy" "runtime" {
         Sid      = "S3Reports"
         Effect   = "Allow"
         Action   = ["s3:PutObject", "s3:GetObject"]
-        Resource = "${aws_s3_bucket.reports.arn}/*"
+        Resource = "arn:aws:s3:::${local.full_name}/*"
       },
       {
         Sid    = "DynamoHistory"
@@ -68,7 +68,7 @@ resource "aws_iam_role_policy" "runtime" {
 # Lambda function (container image)
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/${local.name}"
+  name              = "/aws/lambda/${local.full_name}"
   retention_in_days = var.log_retention_days
 }
 
@@ -88,13 +88,35 @@ resource "null_resource" "build_zip" {
   }
 }
 
+resource "aws_s3_object" "lambda_zip" {
+  bucket = local.full_name
+  key    = "lambda/function.zip"
+  source = "${path.module}/../build/function.zip"
+
+  # Hash of the inputs that drive the build, NOT the built zip itself —
+  # filemd5(zip) is unstable between plan and apply because null_resource
+  # regenerates the zip during apply.
+  source_hash = sha256(join("", [
+    filesha256("${path.module}/../cost_reporter.py"),
+    filesha256("${path.module}/../lambda_handler.py"),
+    filesha256("${path.module}/../uv.lock"),
+    filesha256("${path.module}/../scripts/build.sh"),
+  ]))
+
+  depends_on = [null_resource.build_zip]
+}
+
 resource "aws_lambda_function" "reporter" {
-  function_name = local.name
+  function_name = local.full_name
   role          = aws_iam_role.lambda.arn
   package_type  = "Zip"
   runtime       = "python3.12"
   handler       = "lambda_handler.handler"
-  filename      = "${path.module}/../build/function.zip"
+
+  # Upload via S3 — direct API upload is capped at ~70 MB per request, which
+  # polars + its Rust runtime exceeds. S3 avoids that limit.
+  s3_bucket = aws_s3_object.lambda_zip.bucket
+  s3_key    = aws_s3_object.lambda_zip.key
 
   # Hash of source files rather than the zip — plan never needs the zip to
   # exist; null_resource.build_zip always produces a fresh zip before apply.
@@ -108,7 +130,7 @@ resource "aws_lambda_function" "reporter" {
 
   environment {
     variables = {
-      S3_BUCKET               = aws_s3_bucket.reports.id
+      S3_BUCKET               = local.full_name
       DYNAMODB_TABLE          = aws_dynamodb_table.history.name
       SLACK_WEBHOOK_SSM_PARAM = aws_ssm_parameter.slack_webhook.name
       ENVIRONMENT             = var.environment
@@ -119,7 +141,7 @@ resource "aws_lambda_function" "reporter" {
   depends_on = [
     aws_iam_role_policy.runtime,
     aws_cloudwatch_log_group.lambda,
-    null_resource.build_zip,
+    aws_s3_object.lambda_zip,
   ]
 }
 
@@ -127,7 +149,7 @@ resource "aws_lambda_function" "reporter" {
 # EventBridge schedule — 03:30 UTC daily = 09:00 IST
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_event_rule" "daily" {
-  name                = "${local.name}-daily"
+  name                = "${local.full_name}-daily"
   description         = "Trigger cost reporter daily at 03:30 UTC (09:00 IST)"
   schedule_expression = var.schedule_expression
 }
@@ -150,7 +172,7 @@ resource "aws_lambda_permission" "eventbridge" {
 # CloudWatch alarm — fires if the Lambda has ANY errors in a 24h window
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "errors" {
-  alarm_name          = "${local.name}-errors"
+  alarm_name          = "${local.full_name}-errors"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
