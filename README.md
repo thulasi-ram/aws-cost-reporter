@@ -13,7 +13,7 @@ at 09:00 IST.
 EventBridge (03:30 UTC daily)
         │
         ▼
-  Lambda (container image)
+  Lambda (zip, python3.12)
         │
         ├── Cost Explorer (payer account)   ← 1 call, 95 days, grouped by account+service
         ├── Organizations.ListAccounts       ← human account names
@@ -47,7 +47,7 @@ Override the report day (defaults to T-2 UTC):
 uv run cost_reporter.py --date 2026-04-01 --output-dir ./out
 ```
 
-## Phase 2 — Lambda container + Slack delivery
+## Phase 2 — Lambda zip + Slack delivery
 
 `lambda_handler.py` is the Lambda entrypoint. It reuses the pipeline from
 `cost_reporter.py` and layers on the delivery glue:
@@ -59,11 +59,12 @@ uv run cost_reporter.py --date 2026-04-01 --output-dir ./out
 - On failure: short error posted to Slack and the Lambda re-raises so the
   CloudWatch alarm fires
 
-Build the image locally to smoke-test:
-
-```bash
-docker buildx build --platform linux/amd64 -t aws-cost-reporter:local .
-```
+`scripts/deploy.sh` builds the deployment zip locally: it `pip install`s the
+runtime deps (polars, matplotlib, seaborn, boto3) into `build/package/`
+using manylinux2014_x86_64 wheels for python 3.12, drops the two `.py`
+files next to them, and zips the result into `build/function.zip`. The
+zipped size lands around ~45 MiB — well under Lambda's 50 MiB direct-upload
+limit and 250 MiB unzipped limit.
 
 ## Phase 3 — OpenTofu provisioning
 
@@ -71,11 +72,10 @@ docker buildx build --platform linux/amd64 -t aws-cost-reporter:local .
 
 | Resource | Purpose |
 |---|---|
-| ECR repo | Hosts the Lambda container image |
 | S3 bucket | Markdown reports + chart PNGs (400-day lifecycle, versioned, SSE-S3) |
 | DynamoDB | History + idempotency run markers (PAY_PER_REQUEST, PITR, 400-day TTL) |
 | SSM SecureString | Slack webhook URL (Tofu creates the shell; value set out-of-band) |
-| Lambda (container) | The reporter itself |
+| Lambda (zip, python3.12) | The reporter itself |
 | IAM role + policies | CE, Organizations, S3, DynamoDB, SSM read |
 | EventBridge rule | `cron(30 3 * * ? *)` = 09:00 IST daily |
 | CloudWatch log group | 30-day retention |
@@ -83,25 +83,20 @@ docker buildx build --platform linux/amd64 -t aws-cost-reporter:local .
 
 ### First-time deployment
 
-There's a bootstrap ordering issue: Lambda needs a container image, which
-needs an ECR repo, which needs Tofu. So the first apply is two-phase.
+Tofu reads `build/function.zip` as the Lambda package, so the zip must
+exist before the first apply. `deploy.sh` builds it; on a fresh machine
+there's no Lambda yet so it just builds and exits.
 
 ```bash
+# 1. Build the deployment zip
+./scripts/deploy.sh
+
+# 2. Apply everything
 cd tofu
 tofu init
-
-# 1. Create just the ECR repo
-tofu apply -target=aws_ecr_repository.this
-
-# 2. Build and push the image (uses the ECR URL from tofu output)
-cd ..
-./scripts/deploy.sh        # builds for linux/amd64, logs in to ECR, pushes :latest
-
-# 3. Apply the rest
-cd tofu
 tofu apply
 
-# 4. Set the real Slack webhook URL in SSM (Tofu left a placeholder)
+# 3. Set the real Slack webhook URL in SSM (Tofu left a placeholder)
 aws ssm put-parameter \
   --name "$(tofu output -raw slack_webhook_ssm_parameter)" \
   --value "https://hooks.slack.com/services/T.../B.../..." \
@@ -111,8 +106,9 @@ aws ssm put-parameter \
 
 ### Subsequent deploys
 
-When you change the Python code, just rebuild and push. `deploy.sh` updates
-the Lambda to the new image in-place; Tofu doesn't need to run.
+When you change the Python code, just rebuild the zip. `deploy.sh` detects
+the existing Lambda and calls `update-function-code` directly; Tofu
+doesn't need to run.
 
 ```bash
 ./scripts/deploy.sh
