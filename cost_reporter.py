@@ -154,6 +154,16 @@ def fetch_account_map() -> dict[str, str]:
     return accounts
 
 
+def _ec2_other_category(usage_type: str) -> str:
+    """Map an EC2-Other usage type to one of three display categories."""
+    ut = usage_type.upper()
+    if "EBS:" in ut:
+        return "EC2 - Other (EBS Volumes)"
+    if "DATATRANSFER" in ut:
+        return "EC2 - Other (Data Transfers)"
+    return "EC2 - Other (Misc)"
+
+
 def fetch_cost_data(start: date, end_exclusive: date) -> list[dict]:
     """Fetch daily AmortizedCost grouped by (LINKED_ACCOUNT, SERVICE).
 
@@ -218,6 +228,84 @@ def to_polars(rows: list[dict]) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame(schema=schema)
     return pl.DataFrame(rows, schema=schema)
+
+
+def fetch_ec2_other_breakdown(start: date, end_exclusive: date) -> list[dict]:
+    """Fetch daily AmortizedCost for EC2 - Other broken down by USAGE_TYPE.
+
+    Returns rows already mapped to three service-name categories so the caller
+    can concat them into the main DataFrame after dropping 'EC2 - Other'.
+    """
+    logger.info("Fetching EC2-Other breakdown %s -> %s (exclusive)", start, end_exclusive)
+    ce = boto3.client("ce", region_name=CE_REGION)
+    rows: list[dict] = []
+    next_token: str | None = None
+    page_no = 0
+    while True:
+        page_no += 1
+        kwargs = dict(
+            TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+            Granularity="DAILY",
+            Metrics=["AmortizedCost"],
+            GroupBy=[
+                {"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"},
+                {"Type": "DIMENSION", "Key": "USAGE_TYPE"},
+            ],
+            Filter={
+                "And": [
+                    {
+                        "Dimensions": {
+                            "Key": "SERVICE",
+                            "Values": ["EC2 - Other"],
+                        }
+                    },
+                    {
+                        "Not": {
+                            "Dimensions": {
+                                "Key": "RECORD_TYPE",
+                                "Values": EXCLUDED_RECORD_TYPES,
+                            }
+                        }
+                    },
+                ]
+            },
+        )
+        if next_token:
+            kwargs["NextPageToken"] = next_token
+        resp = ce.get_cost_and_usage(**kwargs)
+        for result in resp["ResultsByTime"]:
+            day = date.fromisoformat(result["TimePeriod"]["Start"])
+            for group in result["Groups"]:
+                account_id, usage_type = group["Keys"]
+                amount = float(group["Metrics"]["AmortizedCost"]["Amount"])
+                rows.append(
+                    {
+                        "date": day,
+                        "account_id": account_id,
+                        "service": _ec2_other_category(usage_type),
+                        "cost": amount,
+                    }
+                )
+        next_token = resp.get("NextPageToken")
+        if not next_token:
+            break
+    logger.info("Fetched %d EC2-Other breakdown rows across %d page(s)", len(rows), page_no)
+    return rows
+
+
+def build_cost_dataframe(start: date, end_exclusive: date) -> pl.DataFrame:
+    """Fetch CE data and return a unified DataFrame.
+
+    EC2 - Other is replaced with three categorized sub-rows:
+    EBS Volumes, Data Transfers, and Misc.
+    """
+    rows = fetch_cost_data(start, end_exclusive)
+    df = to_polars(rows)
+    ec2_rows = fetch_ec2_other_breakdown(start, end_exclusive)
+    if ec2_rows:
+        df = df.filter(pl.col("service") != "EC2 - Other")
+        df = pl.concat([df, to_polars(ec2_rows)])
+    return df
 
 
 # -----------------------------------------------------------------------------
@@ -313,6 +401,12 @@ def build_account_summary(
         .join(avg_90, on="service", how="full", coalesce=True)
         .join(hist_30d, on="service", how="full", coalesce=True)
         .fill_null(0.0)
+        .filter(
+            (pl.col("yesterday") != 0)
+            | (pl.col("day_before") != 0)
+            | (pl.col("avg_30d") != 0)
+            | (pl.col("avg_90d") != 0)
+        )
         .sort("yesterday", descending=True)
     )
 
@@ -376,16 +470,6 @@ def build_insights(summary: AccountSummary) -> list[str]:
             notes.append(
                 f"**Disappeared** — {svc}: was ${hist_avg:,.2f}/day "
                 "in previous 30d, now ~$0"
-            )
-
-    # EC2-Other is a confusing bucket (EBS, NAT data, snapshots, etc.)
-    ec2_other = summary.services.filter(pl.col("service") == "EC2 - Other")
-    if not ec2_other.is_empty():
-        y = float(ec2_other["yesterday"][0])
-        if y >= 1.0:
-            notes.append(
-                f"_Note:_ `EC2 - Other` = ${y:,.2f}. This bucket contains EBS "
-                "volumes, NAT Gateway data, snapshots, etc."
             )
 
     return notes
@@ -576,12 +660,13 @@ def write_report(
     # Org-wide summary table
     lines.append("## Summary across accounts")
     lines.append("")
-    lines.append("| Account | Yesterday | 30d avg | 90d avg | Δ% DoD |")
-    lines.append("|---|---:|---:|---:|---:|")
+    lines.append("| Account | Day | Day Before | 30d Avg | 90d Avg | Δ% DoD |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
     for s in summaries:
         lines.append(
             f"| {s.account_name} (`{s.account_id}`) "
             f"| {_fmt_usd(s.total_yesterday)} "
+            f"| {_fmt_usd(s.total_day_before)} "
             f"| {_fmt_usd(s.total_avg_30d)} "
             f"| {_fmt_usd(s.total_avg_90d)} "
             f"| {_fmt_delta_pct(s.total_yesterday, s.total_day_before)} |"
@@ -591,8 +676,12 @@ def write_report(
     grand_30 = sum(s.total_avg_30d for s in summaries)
     grand_90 = sum(s.total_avg_90d for s in summaries)
     lines.append(
-        f"| **TOTAL** | **{_fmt_usd(grand_y)}** | **{_fmt_usd(grand_30)}** "
-        f"| **{_fmt_usd(grand_90)}** | **{_fmt_delta_pct(grand_y, grand_p)}** |"
+        f"| **TOTAL** "
+        f"| **{_fmt_usd(grand_y)}** "
+        f"| **{_fmt_usd(grand_p)}** "
+        f"| **{_fmt_usd(grand_30)}** "
+        f"| **{_fmt_usd(grand_90)}** "
+        f"| **{_fmt_delta_pct(grand_y, grand_p)}** |"
     )
     lines.append("")
 
@@ -604,18 +693,20 @@ def write_report(
         lines.append(f"![chart]({rel_chart})")
         lines.append("")
         lines.append(
-            f"**Yesterday:** {_fmt_usd(s.total_yesterday)}  "
-            f"**30d avg:** {_fmt_usd(s.total_avg_30d)}  "
-            f"**90d avg:** {_fmt_usd(s.total_avg_90d)}  "
+            f"**Day:** {_fmt_usd(s.total_yesterday)}  "
+            f"**Day Before:** {_fmt_usd(s.total_day_before)}  "
+            f"**30d Avg:** {_fmt_usd(s.total_avg_30d)}  "
+            f"**90d Avg:** {_fmt_usd(s.total_avg_90d)}  "
             f"**DoD:** {_fmt_delta_pct(s.total_yesterday, s.total_day_before)}"
         )
         lines.append("")
         lines.append(
-            "| # | Service | Yesterday | % of day | 30d avg | 90d avg "
-            "| Δ% DoD | Δ% vs 30d |"
+            "| # | Service | Day | Day Before | 30d Avg | 90d Avg "
+            "| % of Day | Δ% DoD | Δ% vs 30d |"
         )
-        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|")
-        for i, row in enumerate(s.services.head(TOP_N_TABLE).iter_rows(named=True), 1):
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|")
+        table_rows = s.services.head(TOP_N_TABLE)
+        for i, row in enumerate(table_rows.iter_rows(named=True), 1):
             pct_of_day = (
                 f"{row['yesterday'] / s.total_yesterday * 100:.1f}%"
                 if s.total_yesterday > 0
@@ -624,9 +715,10 @@ def write_report(
             lines.append(
                 f"| {i} | {row['service']} "
                 f"| {_fmt_usd(row['yesterday'])} "
-                f"| {pct_of_day} "
+                f"| {_fmt_usd(row['day_before'])} "
                 f"| {_fmt_usd(row['avg_30d'])} "
                 f"| {_fmt_usd(row['avg_90d'])} "
+                f"| {pct_of_day} "
                 f"| {_fmt_delta_pct(row['yesterday'], row['day_before'])} "
                 f"| {_fmt_delta_pct(row['yesterday'], row['avg_30d'])} |"
             )
@@ -653,8 +745,7 @@ def main() -> int:
     logger.info("Report day: %s UTC (window %s -> %s inclusive)", rpt_date, start, rpt_date)
 
     accounts = fetch_account_map()
-    rows = fetch_cost_data(start, end_exclusive)
-    df = to_polars(rows)
+    df = build_cost_dataframe(start, end_exclusive)
 
     # Pass 1: build every account summary so we can derive a stable palette
     summaries: list[AccountSummary] = []

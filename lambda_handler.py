@@ -38,13 +38,12 @@ from cost_reporter import (
     LOOKBACK_DAYS,
     AccountSummary,
     build_account_summary,
+    build_cost_dataframe,
     build_insights,
     build_service_palette,
     fetch_account_map,
-    fetch_cost_data,
     render_chart,
     resolve_report_day,
-    to_polars,
     write_report,
 )
 
@@ -370,8 +369,7 @@ def handler(event: dict, context: object) -> dict:
         )
 
         accounts = fetch_account_map()
-        rows = fetch_cost_data(start, end_exclusive)
-        df = to_polars(rows)
+        df = build_cost_dataframe(start, end_exclusive)
 
         summaries: list[AccountSummary] = []
         insights: dict[str, list[str]] = {}
