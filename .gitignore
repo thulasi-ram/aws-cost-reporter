@@ -4,5 +4,8 @@ __pycache__/
 *.pyo
 .env
 report/
+reports/
+build/
 uv.lock
 .DS_Store
+tofu/.terraform/
