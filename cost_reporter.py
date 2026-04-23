@@ -510,7 +510,34 @@ _HTML_STYLE = """
   --accent: #6ea8fe;
   --up: #ef6c6c;
   --down: #51cf66;
+  --tag-bg: #23384f;
+  --tag-fg: #9fc2ff;
+  --tag-up-bg: #3a1f22;
+  --tag-up-fg: #ff9c9c;
+  --tag-down-bg: #1f3a28;
+  --tag-down-fg: #8be3a4;
+  --bar-2: #384860;
+  --tooltip-theme: dark;
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+:root[data-theme="light"] {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-hi: #f1f4f8;
+  --border: #e3e7ed;
+  --fg: #1a1f2c;
+  --muted: #5d6573;
+  --accent: #2563eb;
+  --up: #c0322f;
+  --down: #1f8a44;
+  --tag-bg: #dbe7fb;
+  --tag-fg: #1c4cb8;
+  --tag-up-bg: #fbe1e0;
+  --tag-up-fg: #a32320;
+  --tag-down-bg: #def3e2;
+  --tag-down-fg: #166c33;
+  --bar-2: #b9c4d6;
+  --tooltip-theme: light;
 }
 * { box-sizing: border-box; }
 html, body { background: var(--bg); color: var(--fg); margin: 0; }
@@ -523,11 +550,29 @@ body {
   max-width: 1200px;
   margin: 0 auto;
 }
-h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
-h2 { font-size: 16px; margin: 0 0 12px; font-weight: 600; }
-h3 { font-size: 15px; margin: 0; font-weight: 600; }
+h1 { font-size: 28px; margin: 0; font-weight: 600;
+     line-height: 1.15; letter-spacing: -0.01em; }
+h2 { font-size: 13px; margin: 0 0 12px; font-weight: 600; }
+h3 { font-size: 13px; margin: 0; font-weight: 600; }
 code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .meta { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+.page-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 4px;
+}
+.theme-toggle {
+  appearance: none;
+  background: var(--panel-hi);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+  line-height: 1;
+}
+.theme-toggle:hover { color: var(--fg); }
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -557,6 +602,11 @@ code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .up { color: var(--up); }
 .down { color: var(--down); }
 .chart-wrap { margin-top: 12px; }
+.subsection {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
 .insights ul { margin: 0; padding-left: 18px; }
 .insights li { margin: 2px 0; }
 .insights .acct-label {
@@ -568,10 +618,18 @@ code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .acct-head {
   display: flex;
   align-items: baseline;
-  gap: 10px;
+  gap: 12px;
   flex-wrap: wrap;
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
+.acct-head h2 {
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+.acct-head code { font-size: 13px; }
 .grid-2 {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -596,27 +654,33 @@ tr:last-child td { border-bottom: none; }
   border-radius: 999px;
   font-size: 11px;
   font-weight: 500;
-  background: #23384f;
-  color: #9fc2ff;
+  background: var(--tag-bg);
+  color: var(--tag-fg);
 }
-.tag.up { background: #3a1f22; color: #ff9c9c; }
-.tag.down { background: #1f3a28; color: #8be3a4; }
+.tag.up { background: var(--tag-up-bg); color: var(--tag-up-fg); }
+.tag.down { background: var(--tag-down-bg); color: var(--tag-down-fg); }
 """
 
 
 _HTML_SCRIPT = """
 const DATA = window.__COST_DATA__;
+const CHARTS = [];
 
-const chartBase = {
-  chart: {
-    toolbar: { show: false },
-    foreColor: '#8892a0',
-    fontFamily: 'inherit',
-    animations: { enabled: false },
-  },
-  grid: { borderColor: '#232932', strokeDashArray: 3 },
-  tooltip: { theme: 'dark', x: { format: 'yyyy-MM-dd' } },
-};
+function cssVar(name) {
+  return getComputedStyle(document.documentElement)
+    .getPropertyValue(name).trim();
+}
+
+function themeColors() {
+  return {
+    fg: cssVar('--fg'),
+    muted: cssVar('--muted'),
+    border: cssVar('--border'),
+    accent: cssVar('--accent'),
+    bar2: cssVar('--bar-2'),
+    tooltip: cssVar('--tooltip-theme') || 'dark',
+  };
+}
 
 function fmtUsd(v) {
   return '$' + Number(v).toLocaleString(undefined, {
@@ -624,61 +688,116 @@ function fmtUsd(v) {
   });
 }
 
-function renderLine(elId, series, opts = {}) {
-  const el = document.getElementById(elId);
-  if (!el || !series.length) return;
-  new ApexCharts(el, {
-    ...chartBase,
-    chart: { ...chartBase.chart, type: 'area', height: opts.height || 180 },
+function chartBase(c) {
+  return {
+    chart: {
+      toolbar: { show: false },
+      foreColor: c.muted,
+      fontFamily: 'inherit',
+      animations: { enabled: false },
+    },
+    grid: { borderColor: c.border, strokeDashArray: 3 },
+    tooltip: { theme: c.tooltip, x: { format: 'yyyy-MM-dd' } },
+  };
+}
+
+function lineOptions(series, opts, c) {
+  const base = chartBase(c);
+  return {
+    ...base,
+    chart: { ...base.chart, type: 'area', height: opts.height || 180 },
     stroke: { curve: 'smooth', width: 2 },
     fill: {
       type: 'gradient',
       gradient: { shadeIntensity: 0.6, opacityFrom: 0.35, opacityTo: 0.05 },
     },
-    colors: [opts.color || '#6ea8fe'],
+    colors: [opts.color || c.accent],
     dataLabels: { enabled: false },
     xaxis: {
       type: 'datetime',
-      labels: { style: { colors: '#8892a0', fontSize: '11px' } },
+      labels: { style: { colors: c.muted, fontSize: '11px' } },
       axisBorder: { show: false }, axisTicks: { show: false },
     },
     yaxis: {
       labels: {
-        style: { colors: '#8892a0', fontSize: '11px' },
+        style: { colors: c.muted, fontSize: '11px' },
         formatter: (v) => '$' + Math.round(v).toLocaleString(),
       },
     },
-    tooltip: { ...chartBase.tooltip, y: { formatter: fmtUsd } },
+    tooltip: { ...base.tooltip, y: { formatter: fmtUsd } },
     series: [{ name: opts.name || 'Cost', data: series.map(d => [d.date, d.cost]) }],
-  }).render();
+  };
+}
+
+function barOptions(services, c) {
+  const base = chartBase(c);
+  return {
+    ...base,
+    chart: { ...base.chart, type: 'bar',
+             height: Math.max(220, services.length * 26), stacked: false },
+    plotOptions: { bar: { horizontal: true, barHeight: '70%', borderRadius: 3 } },
+    colors: [c.accent, c.bar2],
+    dataLabels: { enabled: false },
+    legend: { position: 'top', horizontalAlign: 'right', fontSize: '12px' },
+    xaxis: {
+      labels: {
+        style: { colors: c.muted, fontSize: '11px' },
+        formatter: (v) => '$' + Math.round(v).toLocaleString(),
+      },
+    },
+    yaxis: { labels: { style: { colors: c.fg, fontSize: '12px' } } },
+    tooltip: { ...base.tooltip, y: { formatter: fmtUsd }, x: { show: false } },
+    series: [
+      { name: 'Day', data: services.map(s => ({ x: s.service, y: s.yesterday })) },
+      { name: '30d avg', data: services.map(s => ({ x: s.service, y: s.avg_30d })) },
+    ],
+  };
+}
+
+function renderLine(elId, series, opts) {
+  const el = document.getElementById(elId);
+  if (!el || !series.length) return;
+  const chart = new ApexCharts(el, lineOptions(series, opts, themeColors()));
+  chart.render();
+  CHARTS.push({ chart, kind: 'line', series, opts });
 }
 
 function renderServicesBar(elId, services) {
   const el = document.getElementById(elId);
   if (!el || !services.length) return;
-  new ApexCharts(el, {
-    ...chartBase,
-    chart: { ...chartBase.chart, type: 'bar', height: Math.max(220, services.length * 26), stacked: false },
-    plotOptions: { bar: { horizontal: true, barHeight: '70%', borderRadius: 3 } },
-    colors: ['#6ea8fe', '#384860'],
-    dataLabels: { enabled: false },
-    legend: { position: 'top', horizontalAlign: 'right', fontSize: '12px' },
-    xaxis: {
-      labels: {
-        style: { colors: '#8892a0', fontSize: '11px' },
-        formatter: (v) => '$' + Math.round(v).toLocaleString(),
-      },
-    },
-    yaxis: { labels: { style: { colors: '#e6eaf0', fontSize: '12px' } } },
-    tooltip: { ...chartBase.tooltip, y: { formatter: fmtUsd }, x: { show: false } },
-    series: [
-      { name: 'Day', data: services.map(s => ({ x: s.service, y: s.yesterday })) },
-      { name: '30d avg', data: services.map(s => ({ x: s.service, y: s.avg_30d })) },
-    ],
-  }).render();
+  const chart = new ApexCharts(el, barOptions(services, themeColors()));
+  chart.render();
+  CHARTS.push({ chart, kind: 'bar', services });
+}
+
+function repaintCharts() {
+  const c = themeColors();
+  for (const entry of CHARTS) {
+    const opts = entry.kind === 'line'
+      ? lineOptions(entry.series, entry.opts, c)
+      : barOptions(entry.services, c);
+    entry.chart.updateOptions(opts, false, false);
+  }
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  try { localStorage.setItem('cost-report-theme', theme); } catch (_) {}
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.textContent = theme === 'light' ? '☽ Dark' : '☀ Light';
+  repaintCharts();
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('theme-toggle');
+  if (btn) {
+    btn.textContent = document.documentElement.getAttribute('data-theme') === 'light'
+      ? '☽ Dark' : '☀ Light';
+    btn.addEventListener('click', () => {
+      const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+      applyTheme(cur === 'light' ? 'dark' : 'light');
+    });
+  }
   renderLine('org-trend', DATA.org_trend, { name: 'Org total', height: 220 });
   for (const a of DATA.accounts) {
     renderLine('acct-trend-' + a.account_id, a.trend, {
@@ -706,11 +825,11 @@ def _render_insights_html(
     noisy = [s for s in summaries if insights.get(s.account_id)]
     if not noisy:
         return (
-            '<section class="panel insights"><h2>Insights</h2>'
+            '<div class="subsection insights"><h2>Insights</h2>'
             '<p style="color:var(--muted);margin:0">'
-            "Nothing unusual across any account today.</p></section>"
+            "Nothing unusual across any account today.</p></div>"
         )
-    parts = ['<section class="panel insights"><h2>Insights</h2>']
+    parts = ['<div class="subsection insights"><h2>Insights</h2>']
     for s in noisy:
         parts.append(
             f'<div class="acct-label">{html.escape(s.account_name)} '
@@ -725,7 +844,7 @@ def _render_insights_html(
                 safe = safe.replace("**", "</strong>", 1)
             parts.append(f"<li>{safe}</li>")
         parts.append("</ul>")
-    parts.append("</section>")
+    parts.append("</div>")
     return "".join(parts)
 
 
@@ -758,11 +877,11 @@ def _render_summary_table_html(summaries: list[AccountSummary]) -> str:
         "</tr>"
     )
     return (
-        '<section class="panel"><h2>Summary across accounts</h2>'
+        '<div class="subsection"><h2>Summary across accounts</h2>'
         "<table><thead><tr>"
         "<th>Account</th><th>Day</th><th>Day Before</th>"
         "<th>30d Avg</th><th>90d Avg</th><th>DoD</th>"
-        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></section>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
     )
 
 
@@ -880,8 +999,11 @@ def write_report(
     }
 
     header = (
-        '<section class="panel">'
+        '<div class="page-head">'
         f"<h1>AWS Cost Report — {report_date} (UTC)</h1>"
+        '<button id="theme-toggle" class="theme-toggle" type="button"'
+        ' aria-label="Toggle color theme">☀ Light</button>'
+        '</div>'
         f'<div class="meta">'
         f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
         " · AmortizedCost · excludes "
@@ -901,20 +1023,33 @@ def write_report(
         f'<div class="value">{fmt_usd(grand_90)}</div></div>'
         "</div>"
         f'<div class="chart-wrap"><div id="org-trend"></div></div>'
-        "</section>"
+    )
+
+    overview = (
+        '<section class="panel">'
+        + header
+        + _render_insights_html(summaries, insights)
+        + _render_summary_table_html(summaries)
+        + "</section>"
     )
 
     body = (
-        header
-        + _render_insights_html(summaries, insights)
-        + _render_summary_table_html(summaries)
+        overview
         + "".join(_render_account_card_html(s) for s in summaries)
+    )
+
+    theme_init = (
+        "(function(){try{var t=localStorage.getItem('cost-report-theme');"
+        "if(!t){t=window.matchMedia&&window.matchMedia"
+        "('(prefers-color-scheme: light)').matches?'light':'dark';}"
+        "document.documentElement.setAttribute('data-theme',t);}catch(_){}})();"
     )
 
     doc = (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         f"<title>AWS Cost Report — {report_date}</title>"
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<script>{theme_init}</script>"
         f"<style>{_HTML_STYLE}</style></head><body>"
         + body
         + '<script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>'
