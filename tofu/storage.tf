@@ -36,9 +36,13 @@ resource "aws_dynamodb_table" "history" {
 #
 # Expected JSON shape:
 #   {
-#     "slack_webhook_url": "https://hooks.slack.com/services/...",
-#     "gemini_api_key":    "AIza...",        // optional — enables AI Analysis tab
-#     "gemini_model":      "gemini-2.5-flash" // optional — override default model
+#     "slack_webhook_url":   "https://hooks.slack.com/services/...",
+#     "gemini_api_key":      "AIza...",          // optional — enables AI Analysis
+#     "gemini_model":        "gemini-2.5-flash", // optional — override default
+#     "monthly_budgets_usd": {                   // optional — per-account budget map
+#       "111111111111": 5000,
+#       "222222222222": 1200
+#     }
 #   }
 #
 # Tofu creates the parameter shell with a placeholder. Set the real value
@@ -53,9 +57,10 @@ resource "aws_ssm_parameter" "secrets" {
   description = "JSON secret bundle (slack_webhook_url, gemini_api_key, ...). Set via AWS CLI after apply."
   type        = "SecureString"
   value = jsonencode({
-    slack_webhook_url = "PLACEHOLDER"
-    gemini_api_key    = ""
-    gemini_model      = "gemini-2.5-flash"
+    slack_webhook_url   = "PLACEHOLDER"
+    gemini_api_key      = ""
+    gemini_model        = "gemini-2.5-flash"
+    monthly_budgets_usd = {}
   })
 
   lifecycle {

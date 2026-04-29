@@ -21,9 +21,12 @@ Required environment variables:
     S3_BUCKET           — bucket for the HTML report
     DYNAMODB_TABLE      — table for history + run markers
     SECRETS_SSM_PARAM   — SSM SecureString name holding a JSON object:
-                            slack_webhook_url  (required)
-                            gemini_api_key     (optional — enables AI Analysis)
-                            gemini_model       (optional — default gemini-2.5-flash)
+                            slack_webhook_url    (required)
+                            gemini_api_key       (optional — enables AI Analysis)
+                            gemini_model         (optional — default gemini-2.5-flash)
+                            monthly_budgets_usd  (optional — {account_id: usd}
+                                                  monthly budget map; enables
+                                                  burn-vs-budget analysis)
 Optional:
     PRESIGNED_URL_TTL_DAYS — default 7 (the S3 SigV4 maximum)
     ENVIRONMENT            — label shown in the Slack title (default: prod)
@@ -469,6 +472,20 @@ def handler(event: dict, context: object) -> dict:
     if gemini_model:
         os.environ["GEMINI_MODEL"] = gemini_model
 
+    # Per-account monthly budgets (USD). Optional. Coerce numeric values and
+    # drop anything malformed rather than failing the run.
+    raw_budgets = secrets.get("monthly_budgets_usd") or {}
+    budgets: dict[str, float] = {}
+    if isinstance(raw_budgets, dict):
+        for acct_id, val in raw_budgets.items():
+            try:
+                budgets[str(acct_id)] = float(val)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Skipping non-numeric budget for account %s in SSM bundle",
+                    acct_id,
+                )
+
     # Allow an event-level date override for ad-hoc re-runs via aws lambda invoke
     date_override = event.get("date") if isinstance(event, dict) else None
     report_date = resolve_report_day(date_override)
@@ -503,7 +520,8 @@ def handler(event: dict, context: object) -> dict:
         summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
         commitments = build_commitment_summary(report_date)
         ai_analysis, ai_enabled = maybe_generate_ai_analysis(
-            summaries, insights, commitments, df, report_date
+            summaries, insights, commitments, df, report_date,
+            budgets=budgets or None,
         )
         report_path = write_report(
             summaries,

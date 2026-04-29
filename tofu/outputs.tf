@@ -16,9 +16,13 @@ output "dynamodb_table_name" {
 output "secrets_ssm_parameter" {
   description = <<-EOT
     Consolidated JSON secret + config bundle. Set with:
-      aws ssm put-parameter --name <name> \
-        --value '{"slack_webhook_url":"https://hooks.slack.com/...","gemini_api_key":"AIza...","gemini_model":"gemini-2.5-flash"}' \
-        --type SecureString --overwrite
+      aws ssm put-parameter --name <name> --type SecureString --overwrite \
+        --value '{
+          "slack_webhook_url": "https://hooks.slack.com/...",
+          "gemini_api_key":    "AIza...",
+          "gemini_model":      "gemini-2.5-flash",
+          "monthly_budgets_usd": {"111111111111": 5000, "222222222222": 1200}
+        }'
   EOT
   value       = aws_ssm_parameter.secrets.name
 }

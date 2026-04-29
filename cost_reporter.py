@@ -14,6 +14,7 @@ Run:
 """
 
 import argparse
+import calendar
 import html
 import json
 import logging
@@ -1566,6 +1567,71 @@ def _window_avg_account(
     return float(total or 0.0) / days
 
 
+def _mtd_org(df: pl.DataFrame, end: date) -> float:
+    """Org-wide month-to-date spend, lump services excluded, end-inclusive."""
+    if df.is_empty():
+        return 0.0
+    start = end.replace(day=1)
+    total = (
+        df.filter(~pl.col("service").is_in(list(MONTHLY_LUMP_SERVICES)))
+        .filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        .select(pl.col("cost").sum())
+        .item()
+    )
+    return float(total or 0.0)
+
+
+def _mtd_account(df: pl.DataFrame, account_id: str, end: date) -> float:
+    if df.is_empty():
+        return 0.0
+    start = end.replace(day=1)
+    total = (
+        df.filter(pl.col("account_id") == account_id)
+        .filter(~pl.col("service").is_in(list(MONTHLY_LUMP_SERVICES)))
+        .filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        .select(pl.col("cost").sum())
+        .item()
+    )
+    return float(total or 0.0)
+
+
+def _eom_projection(mtd: float, recent_daily_avg: float, end: date) -> dict:
+    """Naive end-of-month projection: MTD + recent_daily_avg × days_remaining.
+
+    Uses the trailing 7d average as the run-rate proxy. Returns a small
+    dict with the inputs surfaced so the LLM can sanity-check the figure.
+    """
+    days_in_month = calendar.monthrange(end.year, end.month)[1]
+    days_elapsed = end.day  # end-inclusive
+    days_remaining = days_in_month - days_elapsed
+    projection = mtd + recent_daily_avg * days_remaining
+    return {
+        "mtd": round(mtd, 2),
+        "days_elapsed": days_elapsed,
+        "days_remaining": days_remaining,
+        "days_in_month": days_in_month,
+        "run_rate_daily": round(recent_daily_avg, 2),
+        "eom_projection": round(projection, 2),
+    }
+
+
+def _budget_view(
+    monthly_budget: float | None, mtd: float, projection: float
+) -> dict | None:
+    """Compute budget-relative figures for the AI payload. Returns None if no budget."""
+    if not monthly_budget or monthly_budget <= 0:
+        return None
+    pct_used = mtd / monthly_budget * 100.0
+    pct_projected = projection / monthly_budget * 100.0
+    return {
+        "monthly_budget": round(float(monthly_budget), 2),
+        "mtd_pct_of_budget": round(pct_used, 1),
+        "projected_pct_of_budget": round(pct_projected, 1),
+        "projected_overrun": round(max(0.0, projection - monthly_budget), 2),
+        "projected_headroom": round(max(0.0, monthly_budget - projection), 2),
+    }
+
+
 def _weekly_buckets(daily: list[dict], end: date, weeks: int) -> list[dict]:
     """Roll a daily series into ISO-week buckets ending on `end`.
 
@@ -1605,19 +1671,32 @@ def _build_ai_payload(
     commitments: "CommitmentSummary | None",
     df: pl.DataFrame,
     report_date: date,
+    budgets: dict[str, float] | None = None,
 ) -> dict:
     """JSON-friendly snapshot of the report for the LLM.
 
     Includes up to 90 days of daily history at both the org and per-account
-    level, plus pre-computed 7/14/30/90-day averages and weekly rollups so
-    the model can reason about historic patterns and seasonality without
-    needing to re-aggregate.
+    level, pre-computed 7/14/30/90-day averages, weekly rollups, MTD totals,
+    end-of-month projections, and (optionally) per-account monthly budgets so
+    the model can reason about variance, burn, and savings opportunities
+    without needing to re-aggregate.
     """
     grand_y = sum(s.total_yesterday for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
+    budgets = budgets or {}
 
     org_daily_90 = _org_daily_series(df, report_date, AI_HISTORY_DAYS)
     org_weekly = _weekly_buckets(org_daily_90, report_date, weeks=13)
+
+    org_avg_7d = _window_avg_org(df, report_date, 7)
+    org_mtd = _mtd_org(df, report_date)
+    org_forecast = _eom_projection(org_mtd, org_avg_7d, report_date)
+    org_budget_total = sum(
+        float(v) for v in budgets.values() if v and float(v) > 0
+    ) if budgets else 0.0
+    org_budget = _budget_view(
+        org_budget_total or None, org_mtd, org_forecast["eom_projection"]
+    )
 
     accounts_payload = []
     for s in summaries:
@@ -1635,17 +1714,30 @@ def _build_ai_payload(
         acct_daily = _account_daily_series(
             df, s.account_id, report_date, AI_HISTORY_DAYS
         )
+        acct_avg_7d = _window_avg_account(df, s.account_id, report_date, 7)
+        acct_mtd = _mtd_account(df, s.account_id, report_date)
+        acct_forecast = _eom_projection(acct_mtd, acct_avg_7d, report_date)
+        acct_budget_raw = budgets.get(s.account_id) if budgets else None
+        try:
+            acct_budget_val = float(acct_budget_raw) if acct_budget_raw is not None else None
+        except (TypeError, ValueError):
+            acct_budget_val = None
+        acct_budget = _budget_view(
+            acct_budget_val, acct_mtd, acct_forecast["eom_projection"]
+        )
         accounts_payload.append({
             "account_id": s.account_id,
             "account_name": s.account_name,
             "totals": {
                 "yesterday": round(s.total_yesterday, 2),
                 "day_before": round(s.total_day_before, 2),
-                "avg_7d": round(_window_avg_account(df, s.account_id, report_date, 7), 2),
+                "avg_7d": round(acct_avg_7d, 2),
                 "avg_14d": round(_window_avg_account(df, s.account_id, report_date, 14), 2),
                 "avg_30d": round(s.total_avg_30d, 2),
                 "avg_90d": round(s.total_avg_90d, 2),
             },
+            "burn": acct_forecast,
+            "budget": acct_budget,
             "top_services": services,
             "insights": insights.get(s.account_id, []),
             "daily_90d": acct_daily,
@@ -1676,11 +1768,13 @@ def _build_ai_payload(
         "org_totals": {
             "yesterday": round(grand_y, 2),
             "day_before": round(grand_p, 2),
-            "avg_7d": round(_window_avg_org(df, report_date, 7), 2),
+            "avg_7d": round(org_avg_7d, 2),
             "avg_14d": round(_window_avg_org(df, report_date, 14), 2),
             "avg_30d": round(_window_avg_org(df, report_date, 30), 2),
             "avg_90d": round(_window_avg_org(df, report_date, 90), 2),
         },
+        "org_burn": org_forecast,
+        "org_budget": org_budget,
         "org_daily_90d": org_daily_90,
         "org_weekly_13w": org_weekly,
         "accounts": accounts_payload,
@@ -1688,51 +1782,80 @@ def _build_ai_payload(
     }
 
 
-_AI_PROMPT = """You are a senior AWS FinOps analyst. You have up to 90 days
-of daily cost history (org-level and per-account), pre-computed averages
-across 7/14/30/90-day windows, weekly rollups for the last 13 weeks, and a
-30-day Savings Plan / Reserved Instance utilization snapshot. Analyze the
-JSON below and produce a concise HTML fragment for the engineering team.
+_AI_PROMPT = """You are a senior AWS FinOps analyst writing a daily review
+for an engineering team. You have up to 90 days of daily cost history
+(org-level and per-account), pre-computed averages across 7/14/30/90-day
+windows, weekly rollups for the last 13 weeks, month-to-date totals, naive
+end-of-month projections (MTD + 7d-avg × days_remaining), optional per-account
+monthly budgets, and a 30-day Savings Plan / Reserved Instance utilization
+snapshot. Analyze the JSON below and produce an HTML fragment.
 
 Output rules:
 - Output ONLY an HTML fragment (no <html>, <head>, <body>, no markdown fences).
 - Use these tags only: <h3>, <h4>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <code>.
 - No inline styles, no scripts, no images, no links.
 - Open with a 2-3 sentence executive summary in a <p>: today's spend vs 7d/30d/90d
-  averages, the dominant trend direction, and the single biggest savings lever.
+  averages, the dominant trend direction, the projected month-end vs budget (if
+  known), and the single biggest savings lever.
 
 Then produce these sections in order (each as <h3> + content). Skip a section
-only if the data genuinely doesn't support it.
+only if the data genuinely doesn't support it; do not pad.
 
-  1. Trend Snapshot — Compare today vs 7d, 14d, 30d, and 90d averages at the
-     org level. Call out whether spend is accelerating, plateauing, or
-     declining, and quantify the slope (e.g. "+18% vs 30d avg, +9% vs 90d").
-  2. Historic Patterns — Use the 13-week rollup and 90-day daily series to
+  1. Burn &amp; Forecast — Cite org_burn (MTD, run_rate_daily, eom_projection,
+     days_remaining). If org_budget is present, state MTD %, projected %, and
+     projected overrun/headroom in USD. List the top 3 accounts ranked by
+     projected_pct_of_budget (overruns first); flag any account already past
+     100% of MTD pace.
+  2. Trend Snapshot — Compare today vs 7d, 14d, 30d, and 90d averages at the
+     org level. State whether spend is accelerating, plateauing, or declining,
+     and quantify the slope (e.g. "+18% vs 30d, +9% vs 90d"). Note WoW change
+     using the last two weekly buckets.
+  3. Historic Patterns — Use org_weekly_13w and the 90-day daily series to
      identify weekday/weekend seasonality, recurring spikes, growth vs flat
-     baselines, and any structural shifts (e.g. step-up after a launch). Be
+     baselines, and structural shifts (e.g. step-up after a launch). Be
      concrete with week ranges and USD figures.
-  3. Account Hotspots — Accounts driving the biggest absolute and relative
-     changes vs their own 30d/90d baselines. Lead with the top 2-3.
-  4. Service Drivers — Services responsible for the largest movements org-wide.
-     Combine signal across accounts where the same service is rising.
-  5. Anomalies & Watchlist — Surprising spikes, "appeared" / "disappeared"
-     services from the rule-based insights, and items that warrant a follow-up.
-  6. Savings Opportunities — A dedicated savings analysis. Cover at minimum:
-       - Savings Plans / RI utilization gaps and whether the safe-buy
-         hourly recommendation is actually material given on-demand spend.
-       - Workloads with stable baselines that look like good commitment
-         candidates (cite the daily series stability).
-       - Idle / decaying services where avg_90d >> avg_7d.
-       - Any service where the 90d average looks structurally inflated.
-     Quantify each opportunity in $/day and $/month where possible.
-  7. Recommended Actions — 4-7 prioritized, specific bullets. Each action
-     should name the account/service and an expected $ impact range.
+  4. Account Hotspots — Accounts driving the biggest absolute and relative
+     changes vs their own 30d/90d baselines, and accounts with the worst
+     budget variance. Lead with the top 2-3.
+  5. Service Drivers — Services responsible for the largest movements
+     org-wide. Combine signal across accounts where the same service is rising.
+  6. Anomalies &amp; Watchlist — Surprising spikes AND unexpected drops
+     (drops can indicate a broken pipeline / lost data ingestion, not a win —
+     treat them as red flags). Include "appeared" / "disappeared" entries
+     from the rule-based insights. Items that warrant follow-up tomorrow.
+  7. Savings Opportunities — A dedicated, AWS-specific savings analysis.
+     Walk this checklist explicitly and report each item, even briefly:
+       a. Commitments — Savings Plans / RI utilization gaps and whether the
+          safe-buy hourly recommendation is meaningful given on-demand spend.
+          Stable baselines that are good commitment candidates.
+       b. Idle / decaying — services where avg_90d &gt;&gt; avg_7d, or where
+          the daily series shows a steady decline.
+       c. Data transfer — flag if "DataTransfer", "AWS Data Transfer", or
+          inter-AZ / NAT-driven services are large and rising. NAT Gateway
+          and cross-AZ transfer are common silent killers.
+       d. Storage tiering — S3 Standard with stable baselines (Lifecycle to
+          IA / Glacier candidate); EBS spend that may be gp2 (gp3 saves ~20%);
+          snapshot accumulation.
+       e. Compute rightsizing — services with flat baselines and high spend
+          that suggest over-provisioned EC2 / RDS / OpenSearch / ElastiCache.
+       f. Idle infra patterns — load balancers, NAT, RDS, EKS that bill
+          steadily but show no day-of-week variance (suggestive of idle).
+     Quantify each opportunity in $/day AND $/month. If you cannot estimate,
+     say so rather than guessing.
+  8. Data Caveats — One short bulleted list. Call out: short baselines (new
+     accounts), one-day spikes that distort an average, missing days, or
+     services with too-volatile-to-trend behavior. Skip if nothing applies.
+  9. Recommended Actions — Group as <h4>P0 (this week)</h4>, <h4>P1 (this
+     month)</h4>, <h4>P2 (this quarter)</h4>. Under each, 1-3 bullets, each
+     naming the account/service AND an expected $/month impact range
+     (e.g. "$200-$400/mo"). Prioritize by impact × confidence.
 
 Quality bar:
 - Be quantitative. Cite USD amounts and percentages directly from the data.
 - Prefer comparisons across multiple windows over single-day deltas.
-- Do NOT invent services, accounts, or numbers not present in the JSON.
-- If a number is zero or missing, say so plainly rather than fabricating.
+- Treat unexpected drops as red flags, not wins.
+- Do NOT invent services, accounts, services, or numbers not present in the JSON.
+- If a number is zero, missing, or not estimable, say so plainly. No fabrication.
 - Keep it skimmable — short paragraphs, tight bullets, bold key figures with
   <strong>.
 
@@ -1799,22 +1922,54 @@ def maybe_generate_ai_analysis(
     commitments: "CommitmentSummary | None",
     df: pl.DataFrame,
     report_date: date,
+    budgets: dict[str, float] | None = None,
 ) -> tuple[str | None, bool]:
     """Generate AI analysis if a Gemini API key is in the env.
 
     Returns (analysis_html, enabled). `enabled` reflects whether a key was
     found, regardless of whether the API call ultimately succeeded.
+
+    `budgets` is an optional {account_id: monthly_usd} map. When provided,
+    per-account and org-level burn-vs-budget figures are added to the payload
+    and the AI is steered toward variance-aware recommendations.
     """
     key = _ai_api_key()
     if not key:
         logger.info("No GEMINI_API_KEY in env — skipping AI analysis")
         return None, False
     logger.info("Generating AI analysis with %s", _gemini_model())
-    payload = _build_ai_payload(summaries, insights, commitments, df, report_date)
+    payload = _build_ai_payload(
+        summaries, insights, commitments, df, report_date, budgets=budgets
+    )
     analysis = generate_ai_analysis(payload, key)
     if analysis:
         logger.info("AI analysis generated (%d chars)", len(analysis))
     return analysis, True
+
+
+def _budgets_from_env() -> dict[str, float] | None:
+    """Parse MONTHLY_BUDGETS_JSON env var as a {account_id: usd} map.
+
+    Useful for CLI runs without going through the SSM bundle.
+    """
+    raw = os.environ.get("MONTHLY_BUDGETS_JSON")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("MONTHLY_BUDGETS_JSON is not valid JSON; ignoring")
+        return None
+    if not isinstance(parsed, dict):
+        logger.warning("MONTHLY_BUDGETS_JSON must be a JSON object; ignoring")
+        return None
+    out: dict[str, float] = {}
+    for k, v in parsed.items():
+        try:
+            out[str(k)] = float(v)
+        except (TypeError, ValueError):
+            logger.warning("Skipping non-numeric budget for account %s", k)
+    return out or None
 
 
 def _render_ai_panel_html(analysis: str | None, has_key: bool, model: str) -> str:
@@ -1991,7 +2146,8 @@ def main() -> int:
 
     commitments = build_commitment_summary(rpt_date)
     ai_analysis, ai_enabled = maybe_generate_ai_analysis(
-        summaries, insights, commitments, df, rpt_date
+        summaries, insights, commitments, df, rpt_date,
+        budgets=_budgets_from_env(),
     )
     report_path = write_report(
         summaries,
