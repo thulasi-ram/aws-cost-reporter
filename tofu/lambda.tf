@@ -29,7 +29,13 @@ resource "aws_iam_role_policy" "runtime" {
       {
         Sid      = "CostExplorer"
         Effect   = "Allow"
-        Action   = ["ce:GetCostAndUsage"]
+        Action = [
+          "ce:GetCostAndUsage",
+          "ce:GetSavingsPlansUtilization",
+          "ce:GetSavingsPlansCoverage",
+          "ce:GetReservationUtilization",
+          "ce:GetReservationCoverage",
+        ]
         Resource = "*"
       },
       {

@@ -78,16 +78,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--date",
         default=None,
-        help="Override report day (UTC, YYYY-MM-DD). Defaults to T-2.",
+        help="Override report day (UTC, YYYY-MM-DD). Defaults to T-1.",
     )
     return p.parse_args()
 
 
 def resolve_report_day(override: str | None) -> date:
-    """Default to T-2 UTC (last finalized CE day)."""
+    """Default to T-1 UTC (yesterday)."""
     if override:
         return date.fromisoformat(override)
-    return datetime.now(timezone.utc).date() - timedelta(days=2)
+    return datetime.now(timezone.utc).date() - timedelta(days=1)
 
 
 # -----------------------------------------------------------------------------
@@ -265,6 +265,274 @@ def build_cost_dataframe(start: date, end_exclusive: date) -> pl.DataFrame:
         df.group_by(["date", "account_id", "service"])
         .agg(pl.col("cost").sum())
         .sort(["date", "account_id", "service"])
+    )
+
+
+# -----------------------------------------------------------------------------
+# Savings Plans / Reserved Instances utilization + coverage
+# -----------------------------------------------------------------------------
+# Number of trailing days included in the commitments tab.
+COMMIT_LOOKBACK_DAYS = 30
+
+
+@dataclass
+class CommitmentSummary:
+    """Org-level savings plan + reservation snapshot.
+
+    All money figures are in USD.
+
+    `sp_safe_buy_hourly` is a conservative suggestion for an additional
+    hourly Savings Plan commitment: the minimum daily on-demand SP-eligible
+    spend over the lookback window divided by 24. Buying up to that amount
+    would (under current usage) keep utilization at ~100% with zero waste.
+    """
+
+    days: int
+    # Daily series for charts: each entry has {date, util_pct, coverage_pct,
+    # unused_commitment, on_demand_cost}
+    sp_daily: list[dict]
+    ri_daily: list[dict]
+    # Aggregated SP metrics
+    sp_avg_util_pct: float
+    sp_avg_coverage_pct: float
+    sp_total_commitment: float
+    sp_total_unused: float
+    sp_total_savings: float
+    sp_total_on_demand: float  # SP-eligible spend NOT covered (= opportunity)
+    sp_min_daily_on_demand: float
+    sp_safe_buy_hourly: float
+    # Aggregated RI metrics
+    ri_avg_util_pct: float
+    ri_avg_coverage_pct: float
+    ri_total_purchased_hours: float
+    ri_total_unused_hours: float
+    ri_total_savings: float
+    ri_total_on_demand: float
+    ri_min_daily_on_demand: float
+    ri_safe_buy_hourly: float
+
+
+def _safe_float(d: dict, key: str) -> float:
+    """CE returns money/percent fields as strings nested under {'Amount': '...'} or raw strings."""
+    v = d.get(key)
+    if v is None:
+        return 0.0
+    if isinstance(v, dict):
+        v = v.get("Amount", "0")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def fetch_sp_utilization(start: date, end_exclusive: date) -> dict:
+    ce = boto3.client("ce", region_name=CE_REGION)
+    return ce.get_savings_plans_utilization(
+        TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+        Granularity="DAILY",
+    )
+
+
+def fetch_sp_coverage(start: date, end_exclusive: date) -> dict:
+    ce = boto3.client("ce", region_name=CE_REGION)
+    # No GroupBy → one row per day at the org level.
+    return ce.get_savings_plans_coverage(
+        TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+        Granularity="DAILY",
+    )
+
+
+def fetch_ri_utilization(start: date, end_exclusive: date) -> dict:
+    ce = boto3.client("ce", region_name=CE_REGION)
+    return ce.get_reservation_utilization(
+        TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+        Granularity="DAILY",
+    )
+
+
+def fetch_ri_coverage(start: date, end_exclusive: date) -> dict:
+    ce = boto3.client("ce", region_name=CE_REGION)
+    return ce.get_reservation_coverage(
+        TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+        Granularity="DAILY",
+        Metrics=["Hour", "Cost"],
+    )
+
+
+def build_commitment_summary(
+    report_date: date, days: int = COMMIT_LOOKBACK_DAYS
+) -> CommitmentSummary:
+    """Build a 30-day SP + RI snapshot. Errors are logged and reported as zeros.
+
+    Most accounts will have either SPs or RIs but not both, and brand-new
+    accounts have neither. We don't want a missing-permission or empty-result
+    case to break the daily report, so each fetch is independent and any
+    failure produces an empty section rather than a crash.
+    """
+    start = report_date - timedelta(days=days - 1)
+    end_exclusive = report_date + timedelta(days=1)
+
+    # --- Savings Plans ---
+    sp_util_by_day: dict[str, dict] = {}
+    sp_total_commit = sp_total_unused = sp_total_savings = 0.0
+    try:
+        u = fetch_sp_utilization(start, end_exclusive)
+        for entry in u.get("SavingsPlansUtilizationsByTime", []):
+            day = entry["TimePeriod"]["Start"]
+            util = entry.get("Utilization", {})
+            sav = entry.get("Savings", {})
+            sp_util_by_day[day] = {
+                "util_pct": _safe_float(util, "UtilizationPercentage"),
+                "total_commitment": _safe_float(util, "TotalCommitment"),
+                "unused_commitment": _safe_float(util, "UnusedCommitment"),
+                "savings": _safe_float(sav, "NetSavings"),
+            }
+        tot = u.get("Total", {})
+        sp_total_commit = _safe_float(tot.get("Utilization", {}), "TotalCommitment")
+        sp_total_unused = _safe_float(tot.get("Utilization", {}), "UnusedCommitment")
+        sp_total_savings = _safe_float(tot.get("Savings", {}), "NetSavings")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("SP utilization fetch failed: %s", e)
+
+    sp_cov_by_day: dict[str, dict] = {}
+    sp_total_on_demand = 0.0
+    sp_avg_cov = 0.0
+    try:
+        c = fetch_sp_coverage(start, end_exclusive)
+        cov_pcts: list[float] = []
+        for entry in c.get("CoveragesByTime", []):
+            day = entry["TimePeriod"]["Start"]
+            cov = entry.get("Coverage", {})
+            on_demand = _safe_float(cov, "OnDemandCost")
+            sp_cov_by_day[day] = {
+                "coverage_pct": _safe_float(cov, "CoveragePercentage"),
+                "on_demand_cost": on_demand,
+            }
+            cov_pcts.append(_safe_float(cov, "CoveragePercentage"))
+            sp_total_on_demand += on_demand
+        if cov_pcts:
+            sp_avg_cov = sum(cov_pcts) / len(cov_pcts)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("SP coverage fetch failed: %s", e)
+
+    sp_daily: list[dict] = []
+    util_pcts: list[float] = []
+    on_demand_per_day: list[float] = []
+    for day in sorted(set(sp_util_by_day) | set(sp_cov_by_day)):
+        u_row = sp_util_by_day.get(day, {})
+        c_row = sp_cov_by_day.get(day, {})
+        sp_daily.append(
+            {
+                "date": day,
+                "util_pct": u_row.get("util_pct", 0.0),
+                "coverage_pct": c_row.get("coverage_pct", 0.0),
+                "unused_commitment": u_row.get("unused_commitment", 0.0),
+                "on_demand_cost": c_row.get("on_demand_cost", 0.0),
+            }
+        )
+        if u_row.get("util_pct") is not None:
+            util_pcts.append(u_row["util_pct"])
+        if c_row.get("on_demand_cost") is not None:
+            on_demand_per_day.append(c_row["on_demand_cost"])
+
+    sp_avg_util = sum(util_pcts) / len(util_pcts) if util_pcts else 0.0
+    # Floor of daily uncovered-but-eligible spend → safe headroom for new SPs.
+    # Skip the most recent day if it's zero (CE often lags by ~24h on coverage).
+    eligible = [v for v in on_demand_per_day if v > 0]
+    sp_min_on_demand = min(eligible) if eligible else 0.0
+    sp_safe_buy_hourly = sp_min_on_demand / 24.0
+
+    # --- Reserved Instances ---
+    ri_util_by_day: dict[str, dict] = {}
+    ri_total_purchased = ri_total_unused = ri_total_savings = 0.0
+    try:
+        u = fetch_ri_utilization(start, end_exclusive)
+        for entry in u.get("UtilizationsByTime", []):
+            day = entry["TimePeriod"]["Start"]
+            tot_attr = entry.get("Total", {})
+            ri_util_by_day[day] = {
+                "util_pct": _safe_float(tot_attr, "UtilizationPercentage"),
+                "purchased_hours": _safe_float(tot_attr, "PurchasedHours"),
+                "unused_hours": _safe_float(tot_attr, "UnusedHours"),
+                "savings": _safe_float(tot_attr, "NetRISavings"),
+            }
+        tot = u.get("Total", {})
+        ri_total_purchased = _safe_float(tot, "PurchasedHours")
+        ri_total_unused = _safe_float(tot, "UnusedHours")
+        ri_total_savings = _safe_float(tot, "NetRISavings")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("RI utilization fetch failed: %s", e)
+
+    ri_cov_by_day: dict[str, dict] = {}
+    ri_total_on_demand = 0.0
+    ri_avg_cov = 0.0
+    try:
+        c = fetch_ri_coverage(start, end_exclusive)
+        cov_pcts: list[float] = []
+        for entry in c.get("CoveragesByTime", []):
+            day = entry["TimePeriod"]["Start"]
+            tot_attr = entry.get("Total", {})
+            cov = tot_attr.get("CoverageCost", {}) or tot_attr.get("Coverage", {})
+            # CoverageCost has OnDemandCost / ReservedCost / TotalCost.
+            on_demand = _safe_float(cov, "OnDemandCost")
+            cov_pct_obj = tot_attr.get("CoverageHours", {}) or tot_attr.get("Coverage", {})
+            cov_pct = _safe_float(cov_pct_obj, "CoverageHoursPercentage")
+            ri_cov_by_day[day] = {
+                "coverage_pct": cov_pct,
+                "on_demand_cost": on_demand,
+            }
+            cov_pcts.append(cov_pct)
+            ri_total_on_demand += on_demand
+        if cov_pcts:
+            ri_avg_cov = sum(cov_pcts) / len(cov_pcts)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("RI coverage fetch failed: %s", e)
+
+    ri_daily = []
+    util_pcts = []
+    on_demand_per_day = []
+    for day in sorted(set(ri_util_by_day) | set(ri_cov_by_day)):
+        u_row = ri_util_by_day.get(day, {})
+        c_row = ri_cov_by_day.get(day, {})
+        ri_daily.append(
+            {
+                "date": day,
+                "util_pct": u_row.get("util_pct", 0.0),
+                "coverage_pct": c_row.get("coverage_pct", 0.0),
+                "unused_hours": u_row.get("unused_hours", 0.0),
+                "on_demand_cost": c_row.get("on_demand_cost", 0.0),
+            }
+        )
+        if u_row.get("util_pct") is not None:
+            util_pcts.append(u_row["util_pct"])
+        if c_row.get("on_demand_cost") is not None:
+            on_demand_per_day.append(c_row["on_demand_cost"])
+
+    ri_avg_util = sum(util_pcts) / len(util_pcts) if util_pcts else 0.0
+    eligible = [v for v in on_demand_per_day if v > 0]
+    ri_min_on_demand = min(eligible) if eligible else 0.0
+    ri_safe_buy_hourly = ri_min_on_demand / 24.0
+
+    return CommitmentSummary(
+        days=days,
+        sp_daily=sp_daily,
+        ri_daily=ri_daily,
+        sp_avg_util_pct=sp_avg_util,
+        sp_avg_coverage_pct=sp_avg_cov,
+        sp_total_commitment=sp_total_commit,
+        sp_total_unused=sp_total_unused,
+        sp_total_savings=sp_total_savings,
+        sp_total_on_demand=sp_total_on_demand,
+        sp_min_daily_on_demand=sp_min_on_demand,
+        sp_safe_buy_hourly=sp_safe_buy_hourly,
+        ri_avg_util_pct=ri_avg_util,
+        ri_avg_coverage_pct=ri_avg_cov,
+        ri_total_purchased_hours=ri_total_purchased,
+        ri_total_unused_hours=ri_total_unused,
+        ri_total_savings=ri_total_savings,
+        ri_total_on_demand=ri_total_on_demand,
+        ri_min_daily_on_demand=ri_min_on_demand,
+        ri_safe_buy_hourly=ri_safe_buy_hourly,
     )
 
 
@@ -659,6 +927,32 @@ tr:last-child td { border-bottom: none; }
 }
 .tag.up { background: var(--tag-up-bg); color: var(--tag-up-fg); }
 .tag.down { background: var(--tag-down-bg); color: var(--tag-down-fg); }
+.tabs {
+  display: flex; gap: 6px; margin: 12px 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+.tabs button {
+  appearance: none; background: transparent; border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted); font: inherit; font-size: 13px;
+  padding: 8px 14px; cursor: pointer; line-height: 1;
+}
+.tabs button:hover { color: var(--fg); }
+.tabs button.active {
+  color: var(--fg); border-bottom-color: var(--accent); font-weight: 600;
+}
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+.callout {
+  background: var(--panel-hi);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+.callout strong { color: var(--fg); }
 """
 
 
@@ -719,6 +1013,8 @@ function lineOptions(series, opts, c) {
       axisBorder: { show: false }, axisTicks: { show: false },
     },
     yaxis: {
+      min: 0,
+      forceNiceScale: true,
       labels: {
         style: { colors: c.muted, fontSize: '11px' },
         formatter: (v) => '$' + Math.round(v).toLocaleString(),
@@ -726,6 +1022,35 @@ function lineOptions(series, opts, c) {
     },
     tooltip: { ...base.tooltip, y: { formatter: fmtUsd } },
     series: [{ name: opts.name || 'Cost', data: series.map(d => [d.date, d.cost]) }],
+  };
+}
+
+function pctLineOptions(series, opts, c) {
+  const base = chartBase(c);
+  return {
+    ...base,
+    chart: { ...base.chart, type: 'line', height: opts.height || 200 },
+    stroke: { curve: 'smooth', width: 2 },
+    colors: opts.colors || [c.accent],
+    dataLabels: { enabled: false },
+    legend: { position: 'top', horizontalAlign: 'right', fontSize: '12px',
+              labels: { colors: c.fg } },
+    xaxis: {
+      type: 'datetime',
+      labels: { style: { colors: c.muted, fontSize: '11px' } },
+      axisBorder: { show: false }, axisTicks: { show: false },
+    },
+    yaxis: {
+      min: 0,
+      max: 100,
+      labels: {
+        style: { colors: c.muted, fontSize: '11px' },
+        formatter: (v) => Math.round(v) + '%',
+      },
+    },
+    tooltip: { ...base.tooltip,
+               y: { formatter: (v) => Number(v).toFixed(1) + '%' } },
+    series: opts.series,
   };
 }
 
@@ -762,6 +1087,16 @@ function renderLine(elId, series, opts) {
   CHARTS.push({ chart, kind: 'line', series, opts });
 }
 
+function renderPctLine(elId, opts) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const hasData = (opts.series || []).some(s => (s.data || []).length);
+  if (!hasData) return;
+  const chart = new ApexCharts(el, pctLineOptions(null, opts, themeColors()));
+  chart.render();
+  CHARTS.push({ chart, kind: 'pct', opts });
+}
+
 function renderServicesBar(elId, services) {
   const el = document.getElementById(elId);
   if (!el || !services.length) return;
@@ -773,11 +1108,24 @@ function renderServicesBar(elId, services) {
 function repaintCharts() {
   const c = themeColors();
   for (const entry of CHARTS) {
-    const opts = entry.kind === 'line'
-      ? lineOptions(entry.series, entry.opts, c)
-      : barOptions(entry.services, c);
+    let opts;
+    if (entry.kind === 'line') opts = lineOptions(entry.series, entry.opts, c);
+    else if (entry.kind === 'pct') opts = pctLineOptions(null, entry.opts, c);
+    else opts = barOptions(entry.services, c);
     entry.chart.updateOptions(opts, false, false);
   }
+}
+
+function activateTab(name) {
+  document.querySelectorAll('[data-tab]').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === name);
+  });
+  document.querySelectorAll('.tab-panel').forEach(p => {
+    p.classList.toggle('active', p.id === 'tab-' + name);
+  });
+  // ApexCharts mis-measures hidden parents; nudge them after the panel becomes
+  // visible so any unseeded width gets recomputed.
+  window.dispatchEvent(new Event('resize'));
 }
 
 function applyTheme(theme) {
@@ -798,12 +1146,38 @@ document.addEventListener('DOMContentLoaded', () => {
       applyTheme(cur === 'light' ? 'dark' : 'light');
     });
   }
+  document.querySelectorAll('[data-tab]').forEach(b => {
+    b.addEventListener('click', () => activateTab(b.dataset.tab));
+  });
   renderLine('org-trend', DATA.org_trend, { name: 'Org total', height: 220 });
   for (const a of DATA.accounts) {
     renderLine('acct-trend-' + a.account_id, a.trend, {
       name: a.account_name, height: 160,
     });
     renderServicesBar('acct-services-' + a.account_id, a.top_services);
+  }
+  if (DATA.commitments) {
+    const c = DATA.commitments;
+    renderPctLine('sp-util-chart', {
+      height: 240,
+      colors: ['#51cf66', '#6ea8fe'],
+      series: [
+        { name: 'Utilization %',
+          data: c.sp_daily.map(d => [d.date, d.util_pct]) },
+        { name: 'Coverage %',
+          data: c.sp_daily.map(d => [d.date, d.coverage_pct]) },
+      ],
+    });
+    renderPctLine('ri-util-chart', {
+      height: 240,
+      colors: ['#51cf66', '#6ea8fe'],
+      series: [
+        { name: 'Utilization %',
+          data: c.ri_daily.map(d => [d.date, d.util_pct]) },
+        { name: 'Coverage %',
+          data: c.ri_daily.map(d => [d.date, d.coverage_pct]) },
+      ],
+    });
   }
 });
 """
@@ -971,12 +1345,149 @@ def _build_account_payload(
     }
 
 
+def _fmt_hours(h: float) -> str:
+    return f"{h:,.0f} h"
+
+
+def _render_commitments_html(c: "CommitmentSummary | None") -> str:
+    if c is None or (not c.sp_daily and not c.ri_daily):
+        return (
+            '<section class="panel"><h2>Commitments</h2>'
+            '<p style="color:var(--muted);margin:0">'
+            "No Savings Plan or Reservation activity over the last "
+            f"{COMMIT_LOOKBACK_DAYS} days.</p></section>"
+        )
+
+    def kpi(label: str, value: str, sub: str = "") -> str:
+        sub_html = f'<div class="sub">{sub}</div>' if sub else ""
+        return (
+            f'<div class="kpi"><div class="label">{label}</div>'
+            f'<div class="value">{value}</div>{sub_html}</div>'
+        )
+
+    parts: list[str] = ['<section class="panel">']
+    parts.append(
+        f'<h2 style="font-size:18px;margin-bottom:6px;">Commitments — '
+        f"last {c.days} days</h2>"
+        '<div class="meta" style="margin-bottom:14px;">'
+        "Org-level Savings Plan and Reserved Instance utilization &amp; coverage "
+        "from Cost Explorer. The safe-buy suggestion is the floor of daily "
+        "uncovered eligible spend over the window, divided by 24."
+        "</div>"
+    )
+
+    # --- Savings Plans ---
+    if c.sp_daily:
+        parts.append('<h3 style="font-size:15px;margin:8px 0 10px;">Savings Plans</h3>')
+        parts.append('<div class="kpi-row">')
+        parts.append(kpi("Avg utilization", f"{c.sp_avg_util_pct:.1f}%",
+                         f"unused {fmt_usd(c.sp_total_unused)}"))
+        parts.append(kpi("Avg coverage", f"{c.sp_avg_coverage_pct:.1f}%",
+                         f"on-demand {fmt_usd(c.sp_total_on_demand)}"))
+        parts.append(kpi("Total commitment", fmt_usd(c.sp_total_commitment),
+                         f"savings {fmt_usd(c.sp_total_savings)}"))
+        parts.append(kpi("Safe to buy",
+                         f"{fmt_usd(c.sp_safe_buy_hourly)}/hr",
+                         f"min daily uncovered {fmt_usd(c.sp_min_daily_on_demand)}"))
+        parts.append("</div>")
+
+        # Suggestion narrative
+        if c.sp_safe_buy_hourly > 0.01:
+            est_monthly_commit = c.sp_safe_buy_hourly * 24 * 30
+            parts.append(
+                '<div class="callout">'
+                f"<strong>Suggestion:</strong> over the last {c.days} days, the "
+                f"lowest day of SP-eligible on-demand spend was "
+                f"{fmt_usd(c.sp_min_daily_on_demand)}. An additional commitment of "
+                f"<strong>{fmt_usd(c.sp_safe_buy_hourly)}/hour</strong> "
+                f"(~{fmt_usd(est_monthly_commit)}/month) would have run at "
+                "100% utilization without waste. Anything above that risks "
+                "unused commitment unless usage is rising."
+                "</div>"
+            )
+        elif c.sp_avg_util_pct > 0 and c.sp_avg_util_pct < 95:
+            parts.append(
+                '<div class="callout">'
+                f"<strong>Heads up:</strong> SP utilization is {c.sp_avg_util_pct:.1f}% — "
+                f"{fmt_usd(c.sp_total_unused)} of commitment went unused over "
+                f"the last {c.days} days. Hold off on additional purchases "
+                "and look into reshaping the existing commitment instead."
+                "</div>"
+            )
+
+        parts.append(
+            '<div class="chart-wrap">'
+            '<div class="label" style="color:var(--muted);font-size:11px;'
+            'text-transform:uppercase;margin-bottom:4px;">'
+            "SP utilization &amp; coverage</div>"
+            '<div id="sp-util-chart"></div></div>'
+        )
+
+    # --- Reservations ---
+    if c.ri_daily:
+        parts.append(
+            '<h3 style="font-size:15px;margin:24px 0 10px;">Reserved Instances</h3>'
+        )
+        parts.append('<div class="kpi-row">')
+        parts.append(kpi("Avg utilization", f"{c.ri_avg_util_pct:.1f}%",
+                         f"unused {_fmt_hours(c.ri_total_unused_hours)}"))
+        parts.append(kpi("Avg coverage", f"{c.ri_avg_coverage_pct:.1f}%",
+                         f"on-demand {fmt_usd(c.ri_total_on_demand)}"))
+        parts.append(kpi("Purchased hours", _fmt_hours(c.ri_total_purchased_hours),
+                         f"savings {fmt_usd(c.ri_total_savings)}"))
+        parts.append(kpi("Safe to buy",
+                         f"{fmt_usd(c.ri_safe_buy_hourly)}/hr",
+                         f"min daily uncovered {fmt_usd(c.ri_min_daily_on_demand)}"))
+        parts.append("</div>")
+
+        if c.ri_safe_buy_hourly > 0.01:
+            est_monthly = c.ri_safe_buy_hourly * 24 * 30
+            parts.append(
+                '<div class="callout">'
+                f"<strong>Suggestion:</strong> floor of daily reservation-eligible "
+                f"on-demand spend over the last {c.days} days was "
+                f"{fmt_usd(c.ri_min_daily_on_demand)}. Up to "
+                f"<strong>{fmt_usd(c.ri_safe_buy_hourly)}/hour</strong> "
+                f"(~{fmt_usd(est_monthly)}/month) of additional reservations "
+                "would clear at 100% utilization. RIs are instance-family "
+                "specific — drill into the AWS console to pick the family "
+                "before purchasing."
+                "</div>"
+            )
+        elif c.ri_avg_util_pct > 0 and c.ri_avg_util_pct < 95:
+            parts.append(
+                '<div class="callout">'
+                f"<strong>Heads up:</strong> RI utilization is {c.ri_avg_util_pct:.1f}% — "
+                f"{_fmt_hours(c.ri_total_unused_hours)} unused over the last "
+                f"{c.days} days. Investigate before buying more."
+                "</div>"
+            )
+
+        parts.append(
+            '<div class="chart-wrap">'
+            '<div class="label" style="color:var(--muted);font-size:11px;'
+            'text-transform:uppercase;margin-bottom:4px;">'
+            "RI utilization &amp; coverage</div>"
+            '<div id="ri-util-chart"></div></div>'
+        )
+
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def _commitments_payload(c: "CommitmentSummary | None") -> dict | None:
+    if c is None:
+        return None
+    return {"sp_daily": c.sp_daily, "ri_daily": c.ri_daily}
+
+
 def write_report(
     summaries: list[AccountSummary],
     insights: dict[str, list[str]],
     report_date: date,
     out_dir: Path,
     df: pl.DataFrame | None = None,
+    commitments: "CommitmentSummary | None" = None,
 ) -> Path:
     """Render a single-file HTML report (charts via ApexCharts CDN).
 
@@ -996,6 +1507,7 @@ def write_report(
     payload = {
         "org_trend": _org_daily_series(df, report_date, HTML_TREND_DAYS),
         "accounts": [_build_account_payload(s, df, TOP_N_TABLE) for s in summaries],
+        "commitments": _commitments_payload(commitments),
     }
 
     header = (
@@ -1033,10 +1545,24 @@ def write_report(
         + "</section>"
     )
 
-    body = (
-        overview
+    daily_panel = (
+        '<div id="tab-daily" class="tab-panel active">'
+        + overview
         + "".join(_render_account_card_html(s) for s in summaries)
+        + "</div>"
     )
+    commitments_panel = (
+        '<div id="tab-commitments" class="tab-panel">'
+        + _render_commitments_html(commitments)
+        + "</div>"
+    )
+    tabs_nav = (
+        '<nav class="tabs">'
+        '<button data-tab="daily" class="active" type="button">Daily</button>'
+        '<button data-tab="commitments" type="button">Commitments</button>'
+        "</nav>"
+    )
+    body = tabs_nav + daily_panel + commitments_panel
 
     theme_init = (
         "(function(){try{var t=localStorage.getItem('cost-report-theme');"
@@ -1091,7 +1617,10 @@ def main() -> int:
 
     summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
 
-    report_path = write_report(summaries, insights, rpt_date, out_dir, df)
+    commitments = build_commitment_summary(rpt_date)
+    report_path = write_report(
+        summaries, insights, rpt_date, out_dir, df, commitments=commitments
+    )
     logger.info("Wrote %s", report_path)
     return 0
 

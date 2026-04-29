@@ -45,6 +45,7 @@ from cost_reporter import (
     TOP_N_SLACK,
     AccountSummary,
     build_account_summary,
+    build_commitment_summary,
     build_cost_dataframe,
     build_insights,
     fetch_account_map,
@@ -466,7 +467,10 @@ def handler(event: dict, context: object) -> dict:
             insights[acct_id] = build_insights(s)
 
         summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
-        report_path = write_report(summaries, insights, report_date, out_dir, df)
+        commitments = build_commitment_summary(report_date)
+        report_path = write_report(
+            summaries, insights, report_date, out_dir, df, commitments=commitments
+        )
 
         # --- Persist raw data to DynamoDB (unfiltered: includes lump services) ---
         _persist_history(cfg["ddb_table"], df, report_date)
