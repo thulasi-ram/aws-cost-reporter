@@ -27,8 +27,8 @@ resource "aws_iam_role_policy" "runtime" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "CostExplorer"
-        Effect   = "Allow"
+        Sid    = "CostExplorer"
+        Effect = "Allow"
         Action = [
           "ce:GetCostAndUsage",
           "ce:GetSavingsPlansUtilization",
@@ -61,10 +61,10 @@ resource "aws_iam_role_policy" "runtime" {
         Resource = aws_dynamodb_table.history.arn
       },
       {
-        Sid      = "SSMReadWebhook"
+        Sid      = "SSMReadSecrets"
         Effect   = "Allow"
         Action   = ["ssm:GetParameter"]
-        Resource = aws_ssm_parameter.slack_webhook.arn
+        Resource = aws_ssm_parameter.secrets.arn
       },
     ]
   })
@@ -136,11 +136,11 @@ resource "aws_lambda_function" "reporter" {
 
   environment {
     variables = {
-      S3_BUCKET               = local.full_name
-      DYNAMODB_TABLE          = aws_dynamodb_table.history.name
-      SLACK_WEBHOOK_SSM_PARAM = aws_ssm_parameter.slack_webhook.name
-      ENVIRONMENT             = var.environment
-      PRESIGNED_URL_TTL_DAYS  = "7"
+      S3_BUCKET              = local.full_name
+      DYNAMODB_TABLE         = aws_dynamodb_table.history.name
+      SECRETS_SSM_PARAM      = aws_ssm_parameter.secrets.name
+      ENVIRONMENT            = var.environment
+      PRESIGNED_URL_TTL_DAYS = "7"
     }
   }
 

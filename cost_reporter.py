@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -953,6 +955,26 @@ tr:last-child td { border-bottom: none; }
   font-size: 13px;
 }
 .callout strong { color: var(--fg); }
+.ai-analysis .ai-head {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 4px;
+}
+.ai-analysis .ai-head h2 { margin: 0; }
+.ai-analysis .ai-sub {
+  color: var(--muted); font-weight: 400; font-size: 13px;
+}
+.ai-analysis h3 {
+  margin: 18px 0 6px; font-size: 15px; color: var(--fg);
+  border-bottom: 1px solid var(--border); padding-bottom: 4px;
+}
+.ai-analysis h4 { margin: 12px 0 4px; font-size: 13px; color: var(--fg); }
+.ai-analysis p { font-size: 13px; line-height: 1.55; margin: 8px 0; }
+.ai-analysis ul, .ai-analysis ol { font-size: 13px; line-height: 1.55; padding-left: 22px; }
+.ai-analysis li { margin: 3px 0; }
+.ai-analysis code {
+  font-family: var(--mono); font-size: 12px;
+  background: var(--panel-hi); padding: 1px 5px; border-radius: 4px;
+}
 """
 
 
@@ -1481,6 +1503,353 @@ def _commitments_payload(c: "CommitmentSummary | None") -> dict | None:
     return {"sp_daily": c.sp_daily, "ri_daily": c.ri_daily}
 
 
+# -----------------------------------------------------------------------------
+# AI analysis (optional — Gemini AI Studio)
+# -----------------------------------------------------------------------------
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_ENDPOINT = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "{model}:generateContent?key={key}"
+)
+
+
+def _gemini_model() -> str:
+    """Resolve the Gemini model at call time (not import time).
+
+    Read late so callers (e.g. the Lambda handler) can populate `GEMINI_MODEL`
+    from a secrets bundle after the module has already been imported.
+    """
+    return os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+
+
+AI_TOP_SERVICES = 10
+# How many days of daily history we feed the LLM (org + per-account series).
+AI_HISTORY_DAYS = 90
+
+
+def _ai_api_key() -> str | None:
+    return (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("GOOGLE_AI_STUDIO_KEY")
+    )
+
+
+def _window_avg_org(df: pl.DataFrame, end: date, days: int) -> float:
+    """Org-wide daily average over the last `days` days (lump services excluded)."""
+    if df.is_empty():
+        return 0.0
+    start = end - timedelta(days=days - 1)
+    total = (
+        df.filter(~pl.col("service").is_in(list(MONTHLY_LUMP_SERVICES)))
+        .filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        .select(pl.col("cost").sum())
+        .item()
+    )
+    return float(total or 0.0) / days
+
+
+def _window_avg_account(
+    df: pl.DataFrame, account_id: str, end: date, days: int
+) -> float:
+    """Account-level daily average over the last `days` days."""
+    if df.is_empty():
+        return 0.0
+    start = end - timedelta(days=days - 1)
+    total = (
+        df.filter(pl.col("account_id") == account_id)
+        .filter(~pl.col("service").is_in(list(MONTHLY_LUMP_SERVICES)))
+        .filter((pl.col("date") >= start) & (pl.col("date") <= end))
+        .select(pl.col("cost").sum())
+        .item()
+    )
+    return float(total or 0.0) / days
+
+
+def _weekly_buckets(daily: list[dict], end: date, weeks: int) -> list[dict]:
+    """Roll a daily series into ISO-week buckets ending on `end`.
+
+    Each bucket: {week_start, week_end, total, avg_per_day}.
+    Most recent week last; partial trailing week is included as-is.
+    """
+    if not daily:
+        return []
+    by_date: dict[str, float] = {d["date"]: float(d["cost"]) for d in daily}
+    out: list[dict] = []
+    for w in range(weeks - 1, -1, -1):
+        week_end = end - timedelta(days=7 * w)
+        week_start = week_end - timedelta(days=6)
+        total = 0.0
+        days_present = 0
+        cursor = week_start
+        while cursor <= week_end:
+            v = by_date.get(cursor.isoformat())
+            if v is not None:
+                total += v
+                days_present += 1
+            cursor += timedelta(days=1)
+        if days_present == 0:
+            continue
+        out.append({
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+            "total": round(total, 2),
+            "avg_per_day": round(total / days_present, 2),
+        })
+    return out
+
+
+def _build_ai_payload(
+    summaries: list[AccountSummary],
+    insights: dict[str, list[str]],
+    commitments: "CommitmentSummary | None",
+    df: pl.DataFrame,
+    report_date: date,
+) -> dict:
+    """JSON-friendly snapshot of the report for the LLM.
+
+    Includes up to 90 days of daily history at both the org and per-account
+    level, plus pre-computed 7/14/30/90-day averages and weekly rollups so
+    the model can reason about historic patterns and seasonality without
+    needing to re-aggregate.
+    """
+    grand_y = sum(s.total_yesterday for s in summaries)
+    grand_p = sum(s.total_day_before for s in summaries)
+
+    org_daily_90 = _org_daily_series(df, report_date, AI_HISTORY_DAYS)
+    org_weekly = _weekly_buckets(org_daily_90, report_date, weeks=13)
+
+    accounts_payload = []
+    for s in summaries:
+        top = s.services.head(AI_TOP_SERVICES)
+        services = [
+            {
+                "service": row["service"],
+                "yesterday": round(row["yesterday"], 2),
+                "day_before": round(row["day_before"], 2),
+                "avg_30d": round(row["avg_30d"], 2),
+                "avg_90d": round(row["avg_90d"], 2),
+            }
+            for row in top.iter_rows(named=True)
+        ]
+        acct_daily = _account_daily_series(
+            df, s.account_id, report_date, AI_HISTORY_DAYS
+        )
+        accounts_payload.append({
+            "account_id": s.account_id,
+            "account_name": s.account_name,
+            "totals": {
+                "yesterday": round(s.total_yesterday, 2),
+                "day_before": round(s.total_day_before, 2),
+                "avg_7d": round(_window_avg_account(df, s.account_id, report_date, 7), 2),
+                "avg_14d": round(_window_avg_account(df, s.account_id, report_date, 14), 2),
+                "avg_30d": round(s.total_avg_30d, 2),
+                "avg_90d": round(s.total_avg_90d, 2),
+            },
+            "top_services": services,
+            "insights": insights.get(s.account_id, []),
+            "daily_90d": acct_daily,
+            "weekly_13w": _weekly_buckets(acct_daily, report_date, weeks=13),
+        })
+
+    commitments_payload = None
+    if commitments is not None:
+        commitments_payload = {
+            "lookback_days": commitments.days,
+            "sp_avg_util_pct": round(commitments.sp_avg_util_pct, 2),
+            "sp_avg_coverage_pct": round(commitments.sp_avg_coverage_pct, 2),
+            "sp_total_unused": round(commitments.sp_total_unused, 2),
+            "sp_total_savings": round(commitments.sp_total_savings, 2),
+            "sp_total_on_demand": round(commitments.sp_total_on_demand, 2),
+            "sp_safe_buy_hourly": round(commitments.sp_safe_buy_hourly, 4),
+            "ri_avg_util_pct": round(commitments.ri_avg_util_pct, 2),
+            "ri_avg_coverage_pct": round(commitments.ri_avg_coverage_pct, 2),
+            "ri_total_unused_hours": round(commitments.ri_total_unused_hours, 2),
+            "ri_total_savings": round(commitments.ri_total_savings, 2),
+            "ri_total_on_demand": round(commitments.ri_total_on_demand, 2),
+            "ri_safe_buy_hourly": round(commitments.ri_safe_buy_hourly, 4),
+        }
+
+    return {
+        "report_date": report_date.isoformat(),
+        "history_days": AI_HISTORY_DAYS,
+        "org_totals": {
+            "yesterday": round(grand_y, 2),
+            "day_before": round(grand_p, 2),
+            "avg_7d": round(_window_avg_org(df, report_date, 7), 2),
+            "avg_14d": round(_window_avg_org(df, report_date, 14), 2),
+            "avg_30d": round(_window_avg_org(df, report_date, 30), 2),
+            "avg_90d": round(_window_avg_org(df, report_date, 90), 2),
+        },
+        "org_daily_90d": org_daily_90,
+        "org_weekly_13w": org_weekly,
+        "accounts": accounts_payload,
+        "commitments": commitments_payload,
+    }
+
+
+_AI_PROMPT = """You are a senior AWS FinOps analyst. You have up to 90 days
+of daily cost history (org-level and per-account), pre-computed averages
+across 7/14/30/90-day windows, weekly rollups for the last 13 weeks, and a
+30-day Savings Plan / Reserved Instance utilization snapshot. Analyze the
+JSON below and produce a concise HTML fragment for the engineering team.
+
+Output rules:
+- Output ONLY an HTML fragment (no <html>, <head>, <body>, no markdown fences).
+- Use these tags only: <h3>, <h4>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <code>.
+- No inline styles, no scripts, no images, no links.
+- Open with a 2-3 sentence executive summary in a <p>: today's spend vs 7d/30d/90d
+  averages, the dominant trend direction, and the single biggest savings lever.
+
+Then produce these sections in order (each as <h3> + content). Skip a section
+only if the data genuinely doesn't support it.
+
+  1. Trend Snapshot — Compare today vs 7d, 14d, 30d, and 90d averages at the
+     org level. Call out whether spend is accelerating, plateauing, or
+     declining, and quantify the slope (e.g. "+18% vs 30d avg, +9% vs 90d").
+  2. Historic Patterns — Use the 13-week rollup and 90-day daily series to
+     identify weekday/weekend seasonality, recurring spikes, growth vs flat
+     baselines, and any structural shifts (e.g. step-up after a launch). Be
+     concrete with week ranges and USD figures.
+  3. Account Hotspots — Accounts driving the biggest absolute and relative
+     changes vs their own 30d/90d baselines. Lead with the top 2-3.
+  4. Service Drivers — Services responsible for the largest movements org-wide.
+     Combine signal across accounts where the same service is rising.
+  5. Anomalies & Watchlist — Surprising spikes, "appeared" / "disappeared"
+     services from the rule-based insights, and items that warrant a follow-up.
+  6. Savings Opportunities — A dedicated savings analysis. Cover at minimum:
+       - Savings Plans / RI utilization gaps and whether the safe-buy
+         hourly recommendation is actually material given on-demand spend.
+       - Workloads with stable baselines that look like good commitment
+         candidates (cite the daily series stability).
+       - Idle / decaying services where avg_90d >> avg_7d.
+       - Any service where the 90d average looks structurally inflated.
+     Quantify each opportunity in $/day and $/month where possible.
+  7. Recommended Actions — 4-7 prioritized, specific bullets. Each action
+     should name the account/service and an expected $ impact range.
+
+Quality bar:
+- Be quantitative. Cite USD amounts and percentages directly from the data.
+- Prefer comparisons across multiple windows over single-day deltas.
+- Do NOT invent services, accounts, or numbers not present in the JSON.
+- If a number is zero or missing, say so plainly rather than fabricating.
+- Keep it skimmable — short paragraphs, tight bullets, bold key figures with
+  <strong>.
+
+Data:
+"""
+
+
+def _strip_html_fences(text: str) -> str:
+    """Strip ```html ... ``` fences if the model includes them anyway."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+        if t.endswith("```"):
+            t = t[: -3]
+    return t.strip()
+
+
+def generate_ai_analysis(payload: dict, api_key: str) -> str | None:
+    """Call Gemini AI Studio. Returns an HTML fragment or None on error."""
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": _AI_PROMPT + json.dumps(payload, separators=(",", ":"))}
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 4096,
+            "responseMimeType": "text/plain",
+        },
+    }
+    url = GEMINI_ENDPOINT.format(model=_gemini_model(), key=api_key)
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        logger.warning("Gemini call failed: %s", e)
+        return None
+    except json.JSONDecodeError as e:
+        logger.warning("Gemini returned non-JSON: %s", e)
+        return None
+
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        logger.warning("Gemini response missing text: %s", str(data)[:300])
+        return None
+
+    return _strip_html_fences(text) or None
+
+
+def maybe_generate_ai_analysis(
+    summaries: list[AccountSummary],
+    insights: dict[str, list[str]],
+    commitments: "CommitmentSummary | None",
+    df: pl.DataFrame,
+    report_date: date,
+) -> tuple[str | None, bool]:
+    """Generate AI analysis if a Gemini API key is in the env.
+
+    Returns (analysis_html, enabled). `enabled` reflects whether a key was
+    found, regardless of whether the API call ultimately succeeded.
+    """
+    key = _ai_api_key()
+    if not key:
+        logger.info("No GEMINI_API_KEY in env — skipping AI analysis")
+        return None, False
+    logger.info("Generating AI analysis with %s", _gemini_model())
+    payload = _build_ai_payload(summaries, insights, commitments, df, report_date)
+    analysis = generate_ai_analysis(payload, key)
+    if analysis:
+        logger.info("AI analysis generated (%d chars)", len(analysis))
+    return analysis, True
+
+
+def _render_ai_panel_html(analysis: str | None, has_key: bool, model: str) -> str:
+    """Render the AI analysis as a panel at the top of the Daily tab.
+
+    When AI is not configured we render nothing — the Daily tab should not be
+    cluttered with a setup nag on every report. Configuration help lives in
+    the README. When configured but generation failed, show a small notice so
+    the failure isn't silent.
+    """
+    if not has_key:
+        return ""
+    if analysis is None:
+        return (
+            '<section class="panel ai-analysis">'
+            '<div class="ai-head">'
+            '<h2>AI Analysis</h2>'
+            f'<span class="tag">{html.escape(model)}</span>'
+            "</div>"
+            '<div class="callout">'
+            "<strong>Generation failed.</strong> Check the cost_reporter logs "
+            "for the underlying error (network, quota, or API key issue)."
+            "</div></section>"
+        )
+    return (
+        '<section class="panel ai-analysis">'
+        '<div class="ai-head">'
+        '<h2>AI Analysis <span class="ai-sub">— trends, patterns &amp; savings</span></h2>'
+        f'<span class="tag">{html.escape(model)}</span>'
+        "</div>"
+        + analysis +
+        "</section>"
+    )
+
+
 def write_report(
     summaries: list[AccountSummary],
     insights: dict[str, list[str]],
@@ -1488,6 +1857,8 @@ def write_report(
     out_dir: Path,
     df: pl.DataFrame | None = None,
     commitments: "CommitmentSummary | None" = None,
+    ai_analysis: str | None = None,
+    ai_enabled: bool = False,
 ) -> Path:
     """Render a single-file HTML report (charts via ApexCharts CDN).
 
@@ -1547,6 +1918,7 @@ def write_report(
 
     daily_panel = (
         '<div id="tab-daily" class="tab-panel active">'
+        + _render_ai_panel_html(ai_analysis, ai_enabled, _gemini_model())
         + overview
         + "".join(_render_account_card_html(s) for s in summaries)
         + "</div>"
@@ -1618,8 +1990,18 @@ def main() -> int:
     summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
 
     commitments = build_commitment_summary(rpt_date)
+    ai_analysis, ai_enabled = maybe_generate_ai_analysis(
+        summaries, insights, commitments, df, rpt_date
+    )
     report_path = write_report(
-        summaries, insights, rpt_date, out_dir, df, commitments=commitments
+        summaries,
+        insights,
+        rpt_date,
+        out_dir,
+        df,
+        commitments=commitments,
+        ai_analysis=ai_analysis,
+        ai_enabled=ai_enabled,
     )
     logger.info("Wrote %s", report_path)
     return 0

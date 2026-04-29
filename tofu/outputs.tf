@@ -13,9 +13,14 @@ output "dynamodb_table_name" {
   value       = aws_dynamodb_table.history.name
 }
 
-output "slack_webhook_ssm_parameter" {
-  description = "Set the real webhook URL with: aws ssm put-parameter --name <name> --value <url> --type SecureString --overwrite"
-  value       = aws_ssm_parameter.slack_webhook.name
+output "secrets_ssm_parameter" {
+  description = <<-EOT
+    Consolidated JSON secret + config bundle. Set with:
+      aws ssm put-parameter --name <name> \
+        --value '{"slack_webhook_url":"https://hooks.slack.com/...","gemini_api_key":"AIza...","gemini_model":"gemini-2.5-flash"}' \
+        --type SecureString --overwrite
+  EOT
+  value       = aws_ssm_parameter.secrets.name
 }
 
 output "schedule" {

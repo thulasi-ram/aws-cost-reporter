@@ -2,7 +2,7 @@
 
 Procedural flow:
   1. Read config from environment (set by the Tofu-provisioned Lambda)
-  2. Resolve the Slack webhook URL from SSM
+  2. Resolve the JSON secret bundle from SSM (Slack webhook + optional Gemini key)
   3. Run the shared pipeline from cost_reporter.py (CE -> polars -> HTML)
   4. Persist the report-day slice to DynamoDB (history + future trend queries)
   5. Upload the HTML report to S3, generate a presigned URL (7 days)
@@ -18,12 +18,15 @@ design — invocation means "notify", and idempotency belongs on the data
 writes, not on the Slack post.
 
 Required environment variables:
-    S3_BUCKET                — bucket for the HTML report
-    DYNAMODB_TABLE           — table for history + run markers
-    SLACK_WEBHOOK_SSM_PARAM  — SSM parameter name holding the webhook URL
+    S3_BUCKET           — bucket for the HTML report
+    DYNAMODB_TABLE      — table for history + run markers
+    SECRETS_SSM_PARAM   — SSM SecureString name holding a JSON object:
+                            slack_webhook_url  (required)
+                            gemini_api_key     (optional — enables AI Analysis)
+                            gemini_model       (optional — default gemini-2.5-flash)
 Optional:
-    PRESIGNED_URL_TTL_DAYS   — default 7 (the S3 SigV4 maximum)
-    ENVIRONMENT              — label shown in the Slack title (default: prod)
+    PRESIGNED_URL_TTL_DAYS — default 7 (the S3 SigV4 maximum)
+    ENVIRONMENT            — label shown in the Slack title (default: prod)
 """
 
 import json
@@ -51,6 +54,7 @@ from cost_reporter import (
     fetch_account_map,
     fmt_delta_pct,
     fmt_usd,
+    maybe_generate_ai_analysis,
     resolve_report_day,
     write_report,
 )
@@ -78,15 +82,34 @@ def _load_config() -> dict[str, Any]:
     return {
         "s3_bucket": _env("S3_BUCKET"),
         "ddb_table": _env("DYNAMODB_TABLE"),
-        "ssm_param": _env("SLACK_WEBHOOK_SSM_PARAM"),
+        "ssm_param": _env("SECRETS_SSM_PARAM"),
         "ttl_days": int(_env("PRESIGNED_URL_TTL_DAYS", "7", required=False)),
         "environment": _env("ENVIRONMENT", "prod", required=False),
     }
 
 
-def _slack_webhook_url(ssm_param: str) -> str:
+def _load_secrets(ssm_param: str) -> dict[str, str]:
+    """Fetch the JSON secret bundle from SSM and return it as a dict.
+
+    Expected keys:
+        slack_webhook_url  (required)
+        gemini_api_key     (optional — enables AI Analysis)
+    """
     resp = _SSM.get_parameter(Name=ssm_param, WithDecryption=True)
-    return resp["Parameter"]["Value"]
+    raw = resp["Parameter"]["Value"]
+    try:
+        secrets = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"SSM parameter {ssm_param} is not valid JSON: {e}"
+        ) from e
+    if not isinstance(secrets, dict):
+        raise RuntimeError(f"SSM parameter {ssm_param} must be a JSON object")
+    if not secrets.get("slack_webhook_url"):
+        raise RuntimeError(
+            f"SSM parameter {ssm_param} missing required key 'slack_webhook_url'"
+        )
+    return secrets
 
 
 # -----------------------------------------------------------------------------
@@ -433,7 +456,18 @@ def _post_slack_error(webhook_url: str, err: Exception, report_date: date) -> No
 # -----------------------------------------------------------------------------
 def handler(event: dict, context: object) -> dict:
     cfg = _load_config()
-    webhook_url = _slack_webhook_url(cfg["ssm_param"])
+    secrets = _load_secrets(cfg["ssm_param"])
+    webhook_url = secrets["slack_webhook_url"]
+
+    # Expose Gemini config (when present) via env so cost_reporter's AI helper
+    # picks it up without needing a parameter-passing detour. Keeping a single
+    # source of config in the SSM bundle — no duplicate Lambda env vars.
+    gemini_key = secrets.get("gemini_api_key", "").strip()
+    if gemini_key:
+        os.environ["GEMINI_API_KEY"] = gemini_key
+    gemini_model = secrets.get("gemini_model", "").strip()
+    if gemini_model:
+        os.environ["GEMINI_MODEL"] = gemini_model
 
     # Allow an event-level date override for ad-hoc re-runs via aws lambda invoke
     date_override = event.get("date") if isinstance(event, dict) else None
@@ -468,8 +502,18 @@ def handler(event: dict, context: object) -> dict:
 
         summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
         commitments = build_commitment_summary(report_date)
+        ai_analysis, ai_enabled = maybe_generate_ai_analysis(
+            summaries, insights, commitments, df, report_date
+        )
         report_path = write_report(
-            summaries, insights, report_date, out_dir, df, commitments=commitments
+            summaries,
+            insights,
+            report_date,
+            out_dir,
+            df,
+            commitments=commitments,
+            ai_analysis=ai_analysis,
+            ai_enabled=ai_enabled,
         )
 
         # --- Persist raw data to DynamoDB (unfiltered: includes lump services) ---
