@@ -152,11 +152,11 @@ resource "aws_lambda_function" "reporter" {
 }
 
 # ---------------------------------------------------------------------------
-# EventBridge schedule — 03:30 UTC daily = 09:00 IST
+# EventBridge schedule — 08:30 UTC daily = 14:00 IST
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_event_rule" "daily" {
   name                = "${local.full_name}-daily"
-  description         = "Trigger cost reporter daily at 03:30 UTC (09:00 IST)"
+  description         = "Trigger cost reporter daily at 08:30 UTC (14:00 IST)"
   schedule_expression = var.schedule_expression
 }
 

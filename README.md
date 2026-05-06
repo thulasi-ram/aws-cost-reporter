@@ -8,7 +8,7 @@ summary that links out to it.
 ## Architecture
 
 ```
-EventBridge (03:30 UTC = 09:00 IST)
+EventBridge (08:30 UTC = 14:00 IST)
         │
         ▼
   Lambda (zip, python3.12)
@@ -132,7 +132,7 @@ All provisioned by tofu except the S3 bucket:
 | SSM SecureString | Slack webhook. Tofu sets a placeholder, `ignore_changes = [value]` so your real value survives. |
 | Lambda (zip, python3.12) | Reads from S3. |
 | IAM role + inline policy | CE, Organizations, S3, DynamoDB, SSM. |
-| EventBridge rule | `cron(30 3 * * ? *)` — daily 03:30 UTC / 09:00 IST. |
+| EventBridge rule | `cron(30 8 * * ? *)` — daily 08:30 UTC / 14:00 IST (later run lets AWS Cost Explorer finalize T-1). |
 | CloudWatch log group | 30-day retention. |
 | CloudWatch alarm | Fires on ≥1 Lambda error in a 24 h window. |
 
@@ -213,7 +213,7 @@ Schedule lives in `tofu/main.tf` as `var.schedule_expression`:
 
 ```hcl
 variable "schedule_expression" {
-  default = "cron(30 3 * * ? *)"  # 03:30 UTC = 09:00 IST
+  default = "cron(30 8 * * ? *)"  # 08:30 UTC = 14:00 IST
 }
 ```
 

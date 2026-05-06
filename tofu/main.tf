@@ -52,9 +52,9 @@ variable "environment" {
 }
 
 variable "schedule_expression" {
-  description = "EventBridge cron. Default 03:30 UTC = 09:00 IST, Mon-Sun"
+  description = "EventBridge cron. Default 08:30 UTC = 14:00 IST, Mon-Sun (later run gives AWS Cost Explorer more time to finalize T-1 data)"
   type        = string
-  default     = "cron(30 3 * * ? *)"
+  default     = "cron(30 8 * * ? *)"
 }
 
 variable "lambda_memory_mb" {
