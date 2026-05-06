@@ -518,7 +518,7 @@ def handler(event: dict, context: object) -> dict:
             insights[acct_id] = build_insights(s)
 
         summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
-        commitments = build_commitment_summary(report_date)
+        commitments = build_commitment_summary(report_date, account_map=accounts)
         ai_analysis, ai_enabled = maybe_generate_ai_analysis(
             summaries, insights, commitments, df, report_date,
             budgets=budgets or None,

@@ -55,6 +55,7 @@ DOD_ABS_THRESHOLD_USD = 5.0     # ...and larger than this $ amount
 ANOMALY_MULTIPLIER = 2.0        # yesterday > N× 30d avg
 ANOMALY_MIN_USD = 5.0
 NEW_SERVICE_MIN_USD = 1.0
+DELTA_NOISE_FLOOR_USD = 0.5     # suppress DoD/vs-30d % when both sides are below this
 DROPPED_SERVICE_MIN_AVG_USD = 1.0
 
 logger = logging.getLogger("cost_reporter")
@@ -274,8 +275,106 @@ def build_cost_dataframe(start: date, end_exclusive: date) -> pl.DataFrame:
 # -----------------------------------------------------------------------------
 # Savings Plans / Reserved Instances utilization + coverage
 # -----------------------------------------------------------------------------
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Linear-interpolated percentile over `values` (zeros included). 0..100."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _linear_projection(
+    series: list[float], project_days: int
+) -> tuple[list[float], float]:
+    """Naive least-squares fit on an evenly-spaced daily series.
+
+    Returns (projected_values, slope_per_day). Negative projections are
+    clamped to 0 — on-demand spend can't go below zero.
+    """
+    n = len(series)
+    if n < 2 or project_days <= 0:
+        return [], 0.0
+    xs = list(range(n))
+    mean_x = sum(xs) / n
+    mean_y = sum(series) / n
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, series))
+    den = sum((x - mean_x) ** 2 for x in xs)
+    slope = num / den if den else 0.0
+    intercept = mean_y - slope * mean_x
+    proj = [max(0.0, intercept + slope * (n + i)) for i in range(project_days)]
+    return proj, slope
+
+
+def _fetch_sp_inventory() -> tuple[list[dict], bool]:
+    """Best-effort `savingsplans:DescribeSavingsPlans` from current creds.
+
+    SP inventory is per-account in IAM scope, so the management account only
+    sees its own SPs unless cross-account roles are wired up. We return what
+    is visible and a `visible` flag the caller uses to decide whether to
+    show the panel or render an explanatory note.
+    """
+    try:
+        sp = boto3.client("savingsplans", region_name=CE_REGION)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("savingsplans client init failed: %s", e)
+        return [], False
+    out: list[dict] = []
+    today = datetime.now(timezone.utc).date()
+    try:
+        next_token: str | None = None
+        page = 0
+        while True:
+            page += 1
+            kwargs = {"states": ["active"], "maxResults": 100}
+            if next_token:
+                kwargs["nextToken"] = next_token
+            resp = sp.describe_savings_plans(**kwargs)
+            for s in resp.get("savingsPlans", []):
+                end_str = s.get("end")
+                end_dt = None
+                days_left = None
+                if end_str:
+                    try:
+                        end_dt = datetime.fromisoformat(
+                            end_str.replace("Z", "+00:00")
+                        ).date()
+                        days_left = (end_dt - today).days
+                    except ValueError:
+                        pass
+                out.append({
+                    "plan_id": s.get("savingsPlanId", ""),
+                    "type": s.get("savingsPlanType", ""),
+                    "term": s.get("termDurationInSeconds", 0) // 86400,
+                    "hourly": float(s.get("commitment", "0") or 0),
+                    "end": end_dt.isoformat() if end_dt else "",
+                    "days_left": days_left if days_left is not None else -1,
+                })
+            next_token = resp.get("nextToken")
+            if not next_token:
+                break
+    except Exception as e:  # noqa: BLE001
+        logger.warning("describe_savings_plans failed: %s", e)
+        return [], False
+    return out, True
+
 # Number of trailing days included in the commitments tab.
-COMMIT_LOOKBACK_DAYS = 30
+COMMIT_LOOKBACK_DAYS = 90
+
+# Approximate AWS list discounts vs on-demand for sizing 1y/3y commitments.
+# us-east-1 EC2 / Compute SP / Standard RI ranges. Treat as ballpark.
+COMMIT_DISCOUNT_1Y_NU = 0.27   # Compute SP, 1y, no upfront
+COMMIT_DISCOUNT_3Y_AU = 0.54   # Compute SP, 3y, all upfront
+RI_DISCOUNT_1Y_NU = 0.36       # Standard EC2 RI, 1y, no upfront
+RI_DISCOUNT_3Y_AU = 0.62       # Standard EC2 RI, 3y, all upfront
+
+# Project the on-demand series this many days into the future for the chart.
+COMMIT_PROJECT_DAYS = 90
 
 
 @dataclass
@@ -304,6 +403,11 @@ class CommitmentSummary:
     sp_total_on_demand: float  # SP-eligible spend NOT covered (= opportunity)
     sp_min_daily_on_demand: float
     sp_safe_buy_hourly: float
+    sp_safe_buy_p10_hourly: float
+    sp_safe_buy_p25_hourly: float
+    sp_safe_buy_p50_hourly: float
+    sp_avg_daily_on_demand: float
+    sp_effective_discount_pct: float
     # Aggregated RI metrics
     ri_avg_util_pct: float
     ri_avg_coverage_pct: float
@@ -311,8 +415,28 @@ class CommitmentSummary:
     ri_total_unused_hours: float
     ri_total_savings: float
     ri_total_on_demand: float
+    ri_total_reserved_cost: float
     ri_min_daily_on_demand: float
     ri_safe_buy_hourly: float
+    ri_safe_buy_p10_hourly: float
+    ri_safe_buy_p25_hourly: float
+    ri_safe_buy_p50_hourly: float
+    ri_avg_daily_on_demand: float
+    ri_effective_discount_pct: float
+    # Per-linked-account coverage rows. Each entry:
+    # {account_id, sp_on_demand, sp_covered, sp_coverage_pct,
+    #  ri_on_demand, ri_covered, ri_coverage_pct, ri_util_pct}
+    per_account: list[dict]
+    # Linear projection of SP-eligible on-demand $ over the next 90 days.
+    on_demand_projection: list[dict]   # [{date, on_demand}] (future only)
+    on_demand_proj_total: float        # sum of the projection window
+    on_demand_trend_slope: float       # slope per day, $; >0 = growing
+    # SP inventory (best-effort, per-credentials)
+    sp_inventory: list[dict]
+    sp_inventory_visible: bool
+    sp_expiring_30d_hourly: float
+    sp_expiring_60d_hourly: float
+    sp_expiring_90d_hourly: float
 
 
 def _safe_float(d: dict, key: str) -> float:
@@ -345,11 +469,29 @@ def fetch_sp_coverage(start: date, end_exclusive: date) -> dict:
     )
 
 
+def fetch_sp_coverage_by_account(start: date, end_exclusive: date) -> dict:
+    ce = boto3.client("ce", region_name=CE_REGION)
+    return ce.get_savings_plans_coverage(
+        TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+        Granularity="MONTHLY",  # account-level needs an aggregate; daily blows up
+        GroupBy=[{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}],
+    )
+
+
 def fetch_ri_utilization(start: date, end_exclusive: date) -> dict:
     ce = boto3.client("ce", region_name=CE_REGION)
     return ce.get_reservation_utilization(
         TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
         Granularity="DAILY",
+    )
+
+
+def fetch_ri_utilization_by_account(start: date, end_exclusive: date) -> dict:
+    ce = boto3.client("ce", region_name=CE_REGION)
+    return ce.get_reservation_utilization(
+        TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+        Granularity="MONTHLY",
+        GroupBy=[{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}],
     )
 
 
@@ -362,10 +504,22 @@ def fetch_ri_coverage(start: date, end_exclusive: date) -> dict:
     )
 
 
+def fetch_ri_coverage_by_account(start: date, end_exclusive: date) -> dict:
+    ce = boto3.client("ce", region_name=CE_REGION)
+    return ce.get_reservation_coverage(
+        TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
+        Granularity="MONTHLY",
+        GroupBy=[{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}],
+        Metrics=["Hour", "Cost"],
+    )
+
+
 def build_commitment_summary(
-    report_date: date, days: int = COMMIT_LOOKBACK_DAYS
+    report_date: date,
+    days: int = COMMIT_LOOKBACK_DAYS,
+    account_map: dict[str, str] | None = None,
 ) -> CommitmentSummary:
-    """Build a 30-day SP + RI snapshot. Errors are logged and reported as zeros.
+    """Build a 90-day SP + RI snapshot. Errors are logged and reported as zeros.
 
     Most accounts will have either SPs or RIs but not both, and brand-new
     accounts have neither. We don't want a missing-permission or empty-result
@@ -444,6 +598,22 @@ def build_commitment_summary(
     eligible = [v for v in on_demand_per_day if v > 0]
     sp_min_on_demand = min(eligible) if eligible else 0.0
     sp_safe_buy_hourly = sp_min_on_demand / 24.0
+    # Percentile-based safe-buy: more aggressive headroom than the floor.
+    # P10/P25/P50 are computed over ALL days (including zeros) so a workload
+    # that is fully covered half the time correctly suggests a smaller buy.
+    sp_safe_p10 = _percentile(on_demand_per_day, 10) / 24.0
+    sp_safe_p25 = _percentile(on_demand_per_day, 25) / 24.0
+    sp_safe_p50 = _percentile(on_demand_per_day, 50) / 24.0
+    sp_avg_daily_on_demand = (
+        sum(on_demand_per_day) / len(on_demand_per_day) if on_demand_per_day else 0.0
+    )
+    # Effective SP discount = savings / (savings + commitment paid for covered).
+    sp_paid_for_covered = max(0.0, sp_total_commit - sp_total_unused)
+    sp_eff_discount = (
+        100.0 * sp_total_savings / (sp_total_savings + sp_paid_for_covered)
+        if (sp_total_savings + sp_paid_for_covered) > 0
+        else 0.0
+    )
 
     # --- Reserved Instances ---
     ri_util_by_day: dict[str, dict] = {}
@@ -468,6 +638,7 @@ def build_commitment_summary(
 
     ri_cov_by_day: dict[str, dict] = {}
     ri_total_on_demand = 0.0
+    ri_total_reserved_cost = 0.0
     ri_avg_cov = 0.0
     try:
         c = fetch_ri_coverage(start, end_exclusive)
@@ -478,14 +649,17 @@ def build_commitment_summary(
             cov = tot_attr.get("CoverageCost", {}) or tot_attr.get("Coverage", {})
             # CoverageCost has OnDemandCost / ReservedCost / TotalCost.
             on_demand = _safe_float(cov, "OnDemandCost")
+            reserved_cost = _safe_float(cov, "ReservedCost")
             cov_pct_obj = tot_attr.get("CoverageHours", {}) or tot_attr.get("Coverage", {})
             cov_pct = _safe_float(cov_pct_obj, "CoverageHoursPercentage")
             ri_cov_by_day[day] = {
                 "coverage_pct": cov_pct,
                 "on_demand_cost": on_demand,
+                "reserved_cost": reserved_cost,
             }
             cov_pcts.append(cov_pct)
             ri_total_on_demand += on_demand
+            ri_total_reserved_cost += reserved_cost
         if cov_pcts:
             ri_avg_cov = sum(cov_pcts) / len(cov_pcts)
     except Exception as e:  # noqa: BLE001
@@ -515,6 +689,146 @@ def build_commitment_summary(
     eligible = [v for v in on_demand_per_day if v > 0]
     ri_min_on_demand = min(eligible) if eligible else 0.0
     ri_safe_buy_hourly = ri_min_on_demand / 24.0
+    ri_safe_p10 = _percentile(on_demand_per_day, 10) / 24.0
+    ri_safe_p25 = _percentile(on_demand_per_day, 25) / 24.0
+    ri_safe_p50 = _percentile(on_demand_per_day, 50) / 24.0
+    ri_avg_daily_on_demand = (
+        sum(on_demand_per_day) / len(on_demand_per_day) if on_demand_per_day else 0.0
+    )
+    ri_eff_discount = (
+        100.0 * ri_total_savings / (ri_total_savings + ri_total_reserved_cost)
+        if (ri_total_savings + ri_total_reserved_cost) > 0
+        else 0.0
+    )
+
+    # --- Per-linked-account coverage (also doubles as a fallback when org-level
+    # RI metrics return zero because RI sharing is disabled — querying with
+    # GroupBy=LINKED_ACCOUNT bypasses sharing semantics).
+    per_account: dict[str, dict] = {}
+    try:
+        sp_acct = fetch_sp_coverage_by_account(start, end_exclusive)
+        for entry in sp_acct.get("CoveragesByTime", []):
+            for grp in entry.get("Groups", []):
+                acct_id = (grp.get("Attributes", {}) or {}).get("LINKED_ACCOUNT", "")
+                if not acct_id:
+                    continue
+                cov = grp.get("Coverage", {})
+                on_demand = _safe_float(cov, "OnDemandCost")
+                covered = _safe_float(cov, "SpendCoveredBySavingsPlans")
+                cov_pct = _safe_float(cov, "CoveragePercentage")
+                row = per_account.setdefault(acct_id, _empty_account_row(acct_id))
+                row["sp_on_demand"] += on_demand
+                row["sp_covered"] += covered
+                row["_sp_cov_pcts"].append(cov_pct)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("SP coverage by-account fetch failed: %s", e)
+
+    try:
+        ri_acct_cov = fetch_ri_coverage_by_account(start, end_exclusive)
+        for entry in ri_acct_cov.get("CoveragesByTime", []):
+            for grp in entry.get("Groups", []):
+                acct_id = (grp.get("Attributes", {}) or {}).get("LINKED_ACCOUNT", "")
+                if not acct_id:
+                    continue
+                attrs = grp.get("Coverage", {})
+                cov_cost = attrs.get("CoverageCost", {}) or {}
+                cov_hrs = attrs.get("CoverageHours", {}) or {}
+                on_demand = _safe_float(cov_cost, "OnDemandCost")
+                reserved = _safe_float(cov_cost, "ReservedCost")
+                cov_pct = _safe_float(cov_hrs, "CoverageHoursPercentage")
+                row = per_account.setdefault(acct_id, _empty_account_row(acct_id))
+                row["ri_on_demand"] += on_demand
+                row["ri_covered"] += reserved
+                row["_ri_cov_pcts"].append(cov_pct)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("RI coverage by-account fetch failed: %s", e)
+
+    try:
+        ri_acct_util = fetch_ri_utilization_by_account(start, end_exclusive)
+        for entry in ri_acct_util.get("UtilizationsByTime", []):
+            for grp in entry.get("Groups", []):
+                acct_id = (grp.get("Attributes", {}) or {}).get("LINKED_ACCOUNT", "")
+                if not acct_id:
+                    continue
+                tot = grp.get("Attributes", {})  # group-level attrs
+                util = grp.get("Utilization", {}) or {}
+                util_pct = _safe_float(util, "UtilizationPercentage")
+                purchased = _safe_float(util, "PurchasedHours")
+                unused = _safe_float(util, "UnusedHours")
+                savings = _safe_float(util, "NetRISavings")
+                row = per_account.setdefault(acct_id, _empty_account_row(acct_id))
+                row["ri_purchased_hours"] += purchased
+                row["ri_unused_hours"] += unused
+                row["ri_savings"] += savings
+                row["_ri_util_pcts"].append(util_pct)
+                _ = tot  # silence
+    except Exception as e:  # noqa: BLE001
+        logger.warning("RI utilization by-account fetch failed: %s", e)
+
+    per_account_rows = []
+    name_lookup = account_map or {}
+    for acct_id, row in per_account.items():
+        row["account_name"] = name_lookup.get(acct_id, "")
+        sp_cov_pcts = row.pop("_sp_cov_pcts")
+        ri_cov_pcts = row.pop("_ri_cov_pcts")
+        ri_util_pcts = row.pop("_ri_util_pcts")
+        row["sp_coverage_pct"] = sum(sp_cov_pcts) / len(sp_cov_pcts) if sp_cov_pcts else 0.0
+        row["ri_coverage_pct"] = sum(ri_cov_pcts) / len(ri_cov_pcts) if ri_cov_pcts else 0.0
+        row["ri_util_pct"] = sum(ri_util_pcts) / len(ri_util_pcts) if ri_util_pcts else 0.0
+        per_account_rows.append(row)
+    # Sort by SP+RI on-demand desc — the accounts with the most opportunity surface first.
+    per_account_rows.sort(
+        key=lambda r: r["sp_on_demand"] + r["ri_on_demand"], reverse=True
+    )
+
+    # Backfill org-level RI metrics from per-account aggregation if CE returned 0
+    # (typical when RI/SP discount sharing is disabled).
+    if ri_total_on_demand == 0 and per_account_rows:
+        ri_total_on_demand = sum(r["ri_on_demand"] for r in per_account_rows)
+        ri_total_reserved_cost = sum(r["ri_covered"] for r in per_account_rows)
+        if ri_total_on_demand > 0 or ri_total_reserved_cost > 0:
+            ri_avg_cov = (
+                sum(r["ri_coverage_pct"] for r in per_account_rows)
+                / len(per_account_rows)
+            )
+    if ri_total_purchased == 0 and per_account_rows:
+        ri_total_purchased = sum(r["ri_purchased_hours"] for r in per_account_rows)
+        ri_total_unused = sum(r["ri_unused_hours"] for r in per_account_rows)
+        ri_total_savings = sum(r["ri_savings"] for r in per_account_rows)
+        if ri_total_purchased > 0:
+            non_zero = [r["ri_util_pct"] for r in per_account_rows if r["ri_util_pct"] > 0]
+            ri_avg_util = sum(non_zero) / len(non_zero) if non_zero else 0.0
+    if ri_eff_discount == 0 and (ri_total_savings + ri_total_reserved_cost) > 0:
+        ri_eff_discount = (
+            100.0 * ri_total_savings / (ri_total_savings + ri_total_reserved_cost)
+        )
+
+    # --- Linear projection of on-demand $ for the next COMMIT_PROJECT_DAYS days.
+    sp_on_demand_series = [d["on_demand_cost"] for d in sp_daily]
+    proj_values, slope = _linear_projection(sp_on_demand_series, COMMIT_PROJECT_DAYS)
+    proj_series: list[dict] = []
+    if proj_values and sp_daily:
+        last_date = date.fromisoformat(sp_daily[-1]["date"])
+        for i, v in enumerate(proj_values, 1):
+            proj_series.append({
+                "date": (last_date + timedelta(days=i)).isoformat(),
+                "on_demand": round(v, 2),
+            })
+
+    # --- SP inventory + expiry buckets
+    sp_inventory, sp_visible = _fetch_sp_inventory()
+    exp_30 = exp_60 = exp_90 = 0.0
+    for s in sp_inventory:
+        d = s.get("days_left", -1)
+        h = s.get("hourly", 0.0)
+        if d is None or d < 0:
+            continue
+        if d <= 30:
+            exp_30 += h
+        if d <= 60:
+            exp_60 += h
+        if d <= 90:
+            exp_90 += h
 
     return CommitmentSummary(
         days=days,
@@ -528,15 +842,51 @@ def build_commitment_summary(
         sp_total_on_demand=sp_total_on_demand,
         sp_min_daily_on_demand=sp_min_on_demand,
         sp_safe_buy_hourly=sp_safe_buy_hourly,
+        sp_safe_buy_p10_hourly=sp_safe_p10,
+        sp_safe_buy_p25_hourly=sp_safe_p25,
+        sp_safe_buy_p50_hourly=sp_safe_p50,
+        sp_avg_daily_on_demand=sp_avg_daily_on_demand,
+        sp_effective_discount_pct=sp_eff_discount,
         ri_avg_util_pct=ri_avg_util,
         ri_avg_coverage_pct=ri_avg_cov,
         ri_total_purchased_hours=ri_total_purchased,
         ri_total_unused_hours=ri_total_unused,
         ri_total_savings=ri_total_savings,
         ri_total_on_demand=ri_total_on_demand,
+        ri_total_reserved_cost=ri_total_reserved_cost,
         ri_min_daily_on_demand=ri_min_on_demand,
         ri_safe_buy_hourly=ri_safe_buy_hourly,
+        ri_safe_buy_p10_hourly=ri_safe_p10,
+        ri_safe_buy_p25_hourly=ri_safe_p25,
+        ri_safe_buy_p50_hourly=ri_safe_p50,
+        ri_avg_daily_on_demand=ri_avg_daily_on_demand,
+        ri_effective_discount_pct=ri_eff_discount,
+        per_account=per_account_rows,
+        on_demand_projection=proj_series,
+        on_demand_proj_total=sum(proj_values),
+        on_demand_trend_slope=slope,
+        sp_inventory=sp_inventory,
+        sp_inventory_visible=sp_visible,
+        sp_expiring_30d_hourly=exp_30,
+        sp_expiring_60d_hourly=exp_60,
+        sp_expiring_90d_hourly=exp_90,
     )
+
+
+def _empty_account_row(account_id: str) -> dict:
+    return {
+        "account_id": account_id,
+        "sp_on_demand": 0.0,
+        "sp_covered": 0.0,
+        "_sp_cov_pcts": [],
+        "ri_on_demand": 0.0,
+        "ri_covered": 0.0,
+        "_ri_cov_pcts": [],
+        "ri_purchased_hours": 0.0,
+        "ri_unused_hours": 0.0,
+        "ri_savings": 0.0,
+        "_ri_util_pcts": [],
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -1008,7 +1358,20 @@ function fmtUsd(v) {
 function chartBase(c) {
   return {
     chart: {
-      toolbar: { show: false },
+      toolbar: {
+        show: true,
+        tools: {
+          download: false,
+          selection: true,
+          zoom: true,
+          zoomin: true,
+          zoomout: true,
+          pan: false,
+          reset: true,
+        },
+        autoSelected: 'zoom',
+      },
+      zoom: { enabled: true, type: 'x', autoScaleYaxis: true },
       foreColor: c.muted,
       fontFamily: 'inherit',
       animations: { enabled: false },
@@ -1120,6 +1483,47 @@ function renderPctLine(elId, opts) {
   CHARTS.push({ chart, kind: 'pct', opts });
 }
 
+function onDemandProjOptions(opts, c) {
+  const base = chartBase(c);
+  return {
+    ...base,
+    chart: { ...base.chart, type: 'line', height: opts.height || 240 },
+    stroke: { curve: 'smooth', width: [2, 2], dashArray: [0, 6] },
+    colors: [c.accent, c.bar2],
+    dataLabels: { enabled: false },
+    legend: { position: 'top', horizontalAlign: 'right', fontSize: '12px',
+              labels: { colors: c.fg } },
+    xaxis: {
+      type: 'datetime',
+      labels: { style: { colors: c.muted, fontSize: '11px' } },
+      axisBorder: { show: false }, axisTicks: { show: false },
+    },
+    yaxis: {
+      min: 0,
+      forceNiceScale: true,
+      labels: {
+        style: { colors: c.muted, fontSize: '11px' },
+        formatter: (v) => '$' + Math.round(v).toLocaleString(),
+      },
+    },
+    tooltip: { ...base.tooltip, y: { formatter: fmtUsd } },
+    series: [
+      { name: 'Actual on-demand $/day',
+        data: opts.actual.map(d => [d.date, d.on_demand]) },
+      { name: 'Projected (linear, 90d)',
+        data: opts.projection.map(d => [d.date, d.on_demand]) },
+    ],
+  };
+}
+
+function renderOnDemandProjection(elId, opts) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const chart = new ApexCharts(el, onDemandProjOptions(opts, themeColors()));
+  chart.render();
+  CHARTS.push({ chart, kind: 'odp', opts });
+}
+
 function renderServicesBar(elId, services) {
   const el = document.getElementById(elId);
   if (!el || !services.length) return;
@@ -1134,6 +1538,7 @@ function repaintCharts() {
     let opts;
     if (entry.kind === 'line') opts = lineOptions(entry.series, entry.opts, c);
     else if (entry.kind === 'pct') opts = pctLineOptions(null, entry.opts, c);
+    else if (entry.kind === 'odp') opts = onDemandProjOptions(entry.opts, c);
     else opts = barOptions(entry.services, c);
     entry.chart.updateOptions(opts, false, false);
   }
@@ -1181,6 +1586,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   if (DATA.commitments) {
     const c = DATA.commitments;
+    if (c.on_demand_actual && c.on_demand_actual.length) {
+      renderOnDemandProjection('on-demand-trend-chart', {
+        actual: c.on_demand_actual,
+        projection: c.on_demand_projection || [],
+        height: 260,
+      });
+    }
     renderPctLine('sp-util-chart', {
       height: 240,
       colors: ['#51cf66', '#6ea8fe'],
@@ -1209,6 +1621,8 @@ document.addEventListener('DOMContentLoaded', () => {
 def _delta_pct_html(a: float, b: float) -> str:
     """Render a DoD/vs-30d delta as a colored tag, or em-dash when undefined."""
     if b == 0:
+        return '<span class="tag">—</span>'
+    if max(a, b) < DELTA_NOISE_FLOOR_USD:
         return '<span class="tag">—</span>'
     pct = (a - b) / b * 100
     cls = "up" if pct > 0 else "down"
@@ -1372,8 +1786,159 @@ def _fmt_hours(h: float) -> str:
     return f"{h:,.0f} h"
 
 
+def _safe_buy_block(
+    label: str,
+    floor_hr: float,
+    p10_hr: float,
+    p25_hr: float,
+    p50_hr: float,
+    discount_1y: float,
+    discount_3y: float,
+) -> str:
+    """Render the percentile-based safe-buy table for either SP or RI.
+
+    The percentile buckets answer "how aggressive a commitment is OK?". Floor
+    = zero-waste guarantee, P25 = some days have unused spend, P50 = half the
+    days have unused spend (only sane when usage is growing).
+    """
+    def row(name: str, hr: float, note: str) -> str:
+        if hr <= 0.001:
+            return ""
+        monthly = hr * 24 * 30
+        s_1y = hr * 24 * 365 * discount_1y
+        s_3y = hr * 24 * 365 * 3 * discount_3y
+        return (
+            "<tr>"
+            f"<td>{name}</td>"
+            f"<td>{fmt_usd(hr)}/hr</td>"
+            f"<td>{fmt_usd(monthly)}</td>"
+            f"<td>{fmt_usd(s_1y)}</td>"
+            f"<td>{fmt_usd(s_3y)}</td>"
+            f"<td style=\"color:var(--muted);font-size:11px;\">{note}</td>"
+            "</tr>"
+        )
+    rows = [
+        row("Floor (zero-waste)", floor_hr, "smallest day's on-demand"),
+        row("P10 (very safe)", p10_hr, "≤10% of days have leftover"),
+        row("P25 (moderate)", p25_hr, "≤25% of days have leftover"),
+        row("P50 (aggressive)", p50_hr, "half of days have leftover"),
+    ]
+    rows = [r for r in rows if r]
+    if not rows:
+        return ""
+    return (
+        f'<div style="margin:6px 0 14px;"><div class="label" '
+        'style="color:var(--muted);font-size:11px;text-transform:uppercase;'
+        'margin-bottom:6px;">Safe-to-buy headroom — ' + label + "</div>"
+        "<table>"
+        "<thead><tr>"
+        "<th>Tier</th><th>Hourly</th><th>~Monthly</th>"
+        "<th>Est. 1y savings</th><th>Est. 3y savings</th><th></th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+
+
+def _render_per_account_table(
+    rows: list[dict], section_days: int
+) -> str:
+    if not rows:
+        return ""
+    body: list[str] = []
+    for r in rows:
+        # Skip rows that are pure noise (no SP and no RI activity)
+        if (r["sp_on_demand"] + r["sp_covered"]
+                + r["ri_on_demand"] + r["ri_covered"]) < 0.5:
+            continue
+        name = r.get("account_name") or "—"
+        body.append(
+            "<tr>"
+            f"<td>{html.escape(name)} <code>{html.escape(r['account_id'])}</code></td>"
+            f"<td>{fmt_usd(r['sp_on_demand'])}</td>"
+            f"<td>{fmt_usd(r['sp_covered'])}</td>"
+            f"<td>{r['sp_coverage_pct']:.1f}%</td>"
+            f"<td>{fmt_usd(r['ri_on_demand'])}</td>"
+            f"<td>{fmt_usd(r['ri_covered'])}</td>"
+            f"<td>{r['ri_coverage_pct']:.1f}%</td>"
+            f"<td>{r['ri_util_pct']:.1f}%</td>"
+            "</tr>"
+        )
+    if not body:
+        return ""
+    return (
+        '<h3 style="font-size:15px;margin:24px 0 10px;">Per-account coverage '
+        f"— last {section_days} days</h3>"
+        '<div class="meta" style="margin:0 0 8px;">'
+        "Aggregated from Cost Explorer with <code>GroupBy=LinkedAccount</code>. "
+        "This view sees RIs/SPs even when org-level discount sharing is off."
+        "</div>"
+        "<table><thead><tr>"
+        "<th>Account</th>"
+        "<th>SP on-demand</th><th>SP covered</th><th>SP cov %</th>"
+        "<th>RI on-demand</th><th>RI covered</th><th>RI cov %</th>"
+        "<th>RI util %</th>"
+        "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
+    )
+
+
+def _render_inventory(c: "CommitmentSummary") -> str:
+    if not c.sp_inventory_visible:
+        return (
+            '<h3 style="font-size:15px;margin:24px 0 10px;">'
+            "SP inventory &amp; expirations</h3>"
+            '<div class="meta" style="margin:0;">'
+            "Could not enumerate Savings Plans from current credentials. "
+            "<code>savingsplans:DescribeSavingsPlans</code> is per-account; "
+            "for org-wide inventory, run from each account or wire up "
+            "cross-account roles."
+            "</div>"
+        )
+    if not c.sp_inventory:
+        return (
+            '<h3 style="font-size:15px;margin:24px 0 10px;">'
+            "SP inventory &amp; expirations</h3>"
+            '<div class="meta" style="margin:0;">'
+            "No active Savings Plans owned by this account."
+            "</div>"
+        )
+    rows = []
+    for s in sorted(c.sp_inventory, key=lambda x: x.get("days_left", 9999)):
+        d = s.get("days_left", -1)
+        d_str = f"{d}d" if d >= 0 else "—"
+        rows.append(
+            "<tr>"
+            f"<td><code>{html.escape(s.get('plan_id', '')[:24])}…</code></td>"
+            f"<td>{html.escape(s.get('type', ''))}</td>"
+            f"<td>{int(s.get('term', 0))}d</td>"
+            f"<td>{fmt_usd(s.get('hourly', 0.0))}/hr</td>"
+            f"<td>{html.escape(s.get('end', ''))}</td>"
+            f"<td>{d_str}</td>"
+            "</tr>"
+        )
+    callout = ""
+    if c.sp_expiring_90d_hourly > 0.01:
+        callout = (
+            '<div class="callout"><strong>Heads up:</strong> '
+            f"{fmt_usd(c.sp_expiring_30d_hourly)}/hr expires in ≤30d, "
+            f"{fmt_usd(c.sp_expiring_60d_hourly)}/hr in ≤60d, "
+            f"{fmt_usd(c.sp_expiring_90d_hourly)}/hr in ≤90d. "
+            "Coverage will drop unless you renew or reshape ahead of time."
+            "</div>"
+        )
+    return (
+        '<h3 style="font-size:15px;margin:24px 0 10px;">'
+        "SP inventory &amp; expirations</h3>"
+        + callout
+        + "<table><thead><tr>"
+        "<th>Plan ID</th><th>Type</th><th>Term</th>"
+        "<th>Hourly</th><th>End</th><th>Left</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    )
+
+
 def _render_commitments_html(c: "CommitmentSummary | None") -> str:
-    if c is None or (not c.sp_daily and not c.ri_daily):
+    if c is None or (not c.sp_daily and not c.ri_daily and not c.per_account):
         return (
             '<section class="panel"><h2>Commitments</h2>'
             '<p style="color:var(--muted);margin:0">'
@@ -1394,47 +1959,81 @@ def _render_commitments_html(c: "CommitmentSummary | None") -> str:
         f"last {c.days} days</h2>"
         '<div class="meta" style="margin-bottom:14px;">'
         "Org-level Savings Plan and Reserved Instance utilization &amp; coverage "
-        "from Cost Explorer. The safe-buy suggestion is the floor of daily "
-        "uncovered eligible spend over the window, divided by 24."
+        "from Cost Explorer. Safe-to-buy tiers and 1y / 3y savings estimates "
+        "use AWS list discounts (~27% / 54% for Compute SP, ~36% / 62% for "
+        "Standard EC2 RI) — adjust for your actual mix."
         "</div>"
     )
 
-    # --- Savings Plans ---
+    # --- Headline: what you're paying retail today, and the projection
+    monthly_run_rate = c.sp_avg_daily_on_demand * 30
+    trend_arrow = "↑" if c.on_demand_trend_slope > 0.5 else (
+        "↓" if c.on_demand_trend_slope < -0.5 else "→"
+    )
+    trend_word = "growing" if c.on_demand_trend_slope > 0.5 else (
+        "shrinking" if c.on_demand_trend_slope < -0.5 else "flat"
+    )
+    parts.append('<h3 style="font-size:15px;margin:8px 0 10px;">'
+                 "On-demand you’re paying today (post-SP/RI)</h3>")
+    parts.append('<div class="kpi-row">')
+    parts.append(kpi(
+        "On-demand / day",
+        fmt_usd(c.sp_avg_daily_on_demand),
+        f"~{fmt_usd(monthly_run_rate)}/mo run-rate",
+    ))
+    parts.append(kpi(
+        "On-demand / hr",
+        fmt_usd(c.sp_avg_daily_on_demand / 24.0),
+        "average over the window",
+    ))
+    parts.append(kpi(
+        "Trend",
+        f"{trend_arrow} {trend_word}",
+        f"{fmt_usd(abs(c.on_demand_trend_slope))}/day slope",
+    ))
+    parts.append(kpi(
+        "Projected next 90d",
+        fmt_usd(c.on_demand_proj_total),
+        "linear fit on daily on-demand",
+    ))
+    parts.append("</div>")
+    parts.append(
+        '<div class="chart-wrap">'
+        '<div class="label" style="color:var(--muted);font-size:11px;'
+        'text-transform:uppercase;margin-bottom:4px;">'
+        "On-demand $/day — actual + 90d linear projection</div>"
+        '<div id="on-demand-trend-chart"></div></div>'
+    )
+
+    # --- Savings Plans
     if c.sp_daily:
-        parts.append('<h3 style="font-size:15px;margin:8px 0 10px;">Savings Plans</h3>')
+        parts.append('<h3 style="font-size:15px;margin:24px 0 10px;">Savings Plans</h3>')
         parts.append('<div class="kpi-row">')
         parts.append(kpi("Avg utilization", f"{c.sp_avg_util_pct:.1f}%",
                          f"unused {fmt_usd(c.sp_total_unused)}"))
         parts.append(kpi("Avg coverage", f"{c.sp_avg_coverage_pct:.1f}%",
-                         f"on-demand {fmt_usd(c.sp_total_on_demand)}"))
+                         f"effective discount {c.sp_effective_discount_pct:.1f}%"))
         parts.append(kpi("Total commitment", fmt_usd(c.sp_total_commitment),
                          f"savings {fmt_usd(c.sp_total_savings)}"))
-        parts.append(kpi("Safe to buy",
+        parts.append(kpi("Safe to buy (floor)",
                          f"{fmt_usd(c.sp_safe_buy_hourly)}/hr",
                          f"min daily uncovered {fmt_usd(c.sp_min_daily_on_demand)}"))
         parts.append("</div>")
 
-        # Suggestion narrative
-        if c.sp_safe_buy_hourly > 0.01:
-            est_monthly_commit = c.sp_safe_buy_hourly * 24 * 30
-            parts.append(
-                '<div class="callout">'
-                f"<strong>Suggestion:</strong> over the last {c.days} days, the "
-                f"lowest day of SP-eligible on-demand spend was "
-                f"{fmt_usd(c.sp_min_daily_on_demand)}. An additional commitment of "
-                f"<strong>{fmt_usd(c.sp_safe_buy_hourly)}/hour</strong> "
-                f"(~{fmt_usd(est_monthly_commit)}/month) would have run at "
-                "100% utilization without waste. Anything above that risks "
-                "unused commitment unless usage is rising."
-                "</div>"
-            )
-        elif c.sp_avg_util_pct > 0 and c.sp_avg_util_pct < 95:
+        parts.append(_safe_buy_block(
+            "Savings Plans",
+            c.sp_safe_buy_hourly, c.sp_safe_buy_p10_hourly,
+            c.sp_safe_buy_p25_hourly, c.sp_safe_buy_p50_hourly,
+            COMMIT_DISCOUNT_1Y_NU, COMMIT_DISCOUNT_3Y_AU,
+        ))
+
+        if c.sp_avg_util_pct > 0 and c.sp_avg_util_pct < 95:
             parts.append(
                 '<div class="callout">'
                 f"<strong>Heads up:</strong> SP utilization is {c.sp_avg_util_pct:.1f}% — "
                 f"{fmt_usd(c.sp_total_unused)} of commitment went unused over "
-                f"the last {c.days} days. Hold off on additional purchases "
-                "and look into reshaping the existing commitment instead."
+                f"the last {c.days} days. Reshape the existing commitment before "
+                "stacking more on top."
                 "</div>"
             )
 
@@ -1446,8 +2045,8 @@ def _render_commitments_html(c: "CommitmentSummary | None") -> str:
             '<div id="sp-util-chart"></div></div>'
         )
 
-    # --- Reservations ---
-    if c.ri_daily:
+    # --- Reservations
+    if c.ri_daily or any(r["ri_on_demand"] + r["ri_covered"] > 0 for r in c.per_account):
         parts.append(
             '<h3 style="font-size:15px;margin:24px 0 10px;">Reserved Instances</h3>'
         )
@@ -1455,29 +2054,22 @@ def _render_commitments_html(c: "CommitmentSummary | None") -> str:
         parts.append(kpi("Avg utilization", f"{c.ri_avg_util_pct:.1f}%",
                          f"unused {_fmt_hours(c.ri_total_unused_hours)}"))
         parts.append(kpi("Avg coverage", f"{c.ri_avg_coverage_pct:.1f}%",
-                         f"on-demand {fmt_usd(c.ri_total_on_demand)}"))
+                         f"effective discount {c.ri_effective_discount_pct:.1f}%"))
         parts.append(kpi("Purchased hours", _fmt_hours(c.ri_total_purchased_hours),
                          f"savings {fmt_usd(c.ri_total_savings)}"))
-        parts.append(kpi("Safe to buy",
+        parts.append(kpi("Safe to buy (floor)",
                          f"{fmt_usd(c.ri_safe_buy_hourly)}/hr",
                          f"min daily uncovered {fmt_usd(c.ri_min_daily_on_demand)}"))
         parts.append("</div>")
 
-        if c.ri_safe_buy_hourly > 0.01:
-            est_monthly = c.ri_safe_buy_hourly * 24 * 30
-            parts.append(
-                '<div class="callout">'
-                f"<strong>Suggestion:</strong> floor of daily reservation-eligible "
-                f"on-demand spend over the last {c.days} days was "
-                f"{fmt_usd(c.ri_min_daily_on_demand)}. Up to "
-                f"<strong>{fmt_usd(c.ri_safe_buy_hourly)}/hour</strong> "
-                f"(~{fmt_usd(est_monthly)}/month) of additional reservations "
-                "would clear at 100% utilization. RIs are instance-family "
-                "specific — drill into the AWS console to pick the family "
-                "before purchasing."
-                "</div>"
-            )
-        elif c.ri_avg_util_pct > 0 and c.ri_avg_util_pct < 95:
+        parts.append(_safe_buy_block(
+            "Reserved Instances",
+            c.ri_safe_buy_hourly, c.ri_safe_buy_p10_hourly,
+            c.ri_safe_buy_p25_hourly, c.ri_safe_buy_p50_hourly,
+            RI_DISCOUNT_1Y_NU, RI_DISCOUNT_3Y_AU,
+        ))
+
+        if c.ri_avg_util_pct > 0 and c.ri_avg_util_pct < 95:
             parts.append(
                 '<div class="callout">'
                 f"<strong>Heads up:</strong> RI utilization is {c.ri_avg_util_pct:.1f}% — "
@@ -1486,13 +2078,20 @@ def _render_commitments_html(c: "CommitmentSummary | None") -> str:
                 "</div>"
             )
 
-        parts.append(
-            '<div class="chart-wrap">'
-            '<div class="label" style="color:var(--muted);font-size:11px;'
-            'text-transform:uppercase;margin-bottom:4px;">'
-            "RI utilization &amp; coverage</div>"
-            '<div id="ri-util-chart"></div></div>'
-        )
+        if c.ri_daily and any(d.get("util_pct", 0) > 0 for d in c.ri_daily):
+            parts.append(
+                '<div class="chart-wrap">'
+                '<div class="label" style="color:var(--muted);font-size:11px;'
+                'text-transform:uppercase;margin-bottom:4px;">'
+                "RI utilization &amp; coverage</div>"
+                '<div id="ri-util-chart"></div></div>'
+            )
+
+    # --- Per-linked-account drilldown
+    parts.append(_render_per_account_table(c.per_account, c.days))
+
+    # --- SP inventory + expirations
+    parts.append(_render_inventory(c))
 
     parts.append("</section>")
     return "".join(parts)
@@ -1501,7 +2100,16 @@ def _render_commitments_html(c: "CommitmentSummary | None") -> str:
 def _commitments_payload(c: "CommitmentSummary | None") -> dict | None:
     if c is None:
         return None
-    return {"sp_daily": c.sp_daily, "ri_daily": c.ri_daily}
+    actual = [
+        {"date": d["date"], "on_demand": round(d.get("on_demand_cost", 0.0), 2)}
+        for d in c.sp_daily
+    ]
+    return {
+        "sp_daily": c.sp_daily,
+        "ri_daily": c.ri_daily,
+        "on_demand_actual": actual,
+        "on_demand_projection": c.on_demand_projection,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -1753,13 +2361,42 @@ def _build_ai_payload(
             "sp_total_unused": round(commitments.sp_total_unused, 2),
             "sp_total_savings": round(commitments.sp_total_savings, 2),
             "sp_total_on_demand": round(commitments.sp_total_on_demand, 2),
+            "sp_avg_daily_on_demand": round(commitments.sp_avg_daily_on_demand, 2),
+            "sp_effective_discount_pct": round(commitments.sp_effective_discount_pct, 2),
             "sp_safe_buy_hourly": round(commitments.sp_safe_buy_hourly, 4),
+            "sp_safe_buy_p10_hourly": round(commitments.sp_safe_buy_p10_hourly, 4),
+            "sp_safe_buy_p25_hourly": round(commitments.sp_safe_buy_p25_hourly, 4),
+            "sp_safe_buy_p50_hourly": round(commitments.sp_safe_buy_p50_hourly, 4),
             "ri_avg_util_pct": round(commitments.ri_avg_util_pct, 2),
             "ri_avg_coverage_pct": round(commitments.ri_avg_coverage_pct, 2),
             "ri_total_unused_hours": round(commitments.ri_total_unused_hours, 2),
             "ri_total_savings": round(commitments.ri_total_savings, 2),
             "ri_total_on_demand": round(commitments.ri_total_on_demand, 2),
+            "ri_avg_daily_on_demand": round(commitments.ri_avg_daily_on_demand, 2),
+            "ri_effective_discount_pct": round(commitments.ri_effective_discount_pct, 2),
             "ri_safe_buy_hourly": round(commitments.ri_safe_buy_hourly, 4),
+            "ri_safe_buy_p10_hourly": round(commitments.ri_safe_buy_p10_hourly, 4),
+            "ri_safe_buy_p25_hourly": round(commitments.ri_safe_buy_p25_hourly, 4),
+            "ri_safe_buy_p50_hourly": round(commitments.ri_safe_buy_p50_hourly, 4),
+            "on_demand_proj_total_90d": round(commitments.on_demand_proj_total, 2),
+            "on_demand_trend_slope_per_day": round(commitments.on_demand_trend_slope, 4),
+            "sp_expiring_30d_hourly": round(commitments.sp_expiring_30d_hourly, 4),
+            "sp_expiring_60d_hourly": round(commitments.sp_expiring_60d_hourly, 4),
+            "sp_expiring_90d_hourly": round(commitments.sp_expiring_90d_hourly, 4),
+            "per_account": [
+                {
+                    "account_id": r["account_id"],
+                    "account_name": r.get("account_name", ""),
+                    "sp_on_demand": round(r["sp_on_demand"], 2),
+                    "sp_covered": round(r["sp_covered"], 2),
+                    "sp_coverage_pct": round(r["sp_coverage_pct"], 2),
+                    "ri_on_demand": round(r["ri_on_demand"], 2),
+                    "ri_covered": round(r["ri_covered"], 2),
+                    "ri_coverage_pct": round(r["ri_coverage_pct"], 2),
+                    "ri_util_pct": round(r["ri_util_pct"], 2),
+                }
+                for r in commitments.per_account
+            ],
         }
 
     return {
@@ -1787,8 +2424,10 @@ for an engineering team. You have up to 90 days of daily cost history
 (org-level and per-account), pre-computed averages across 7/14/30/90-day
 windows, weekly rollups for the last 13 weeks, month-to-date totals, naive
 end-of-month projections (MTD + 7d-avg × days_remaining), optional per-account
-monthly budgets, and a 30-day Savings Plan / Reserved Instance utilization
-snapshot. Analyze the JSON below and produce an HTML fragment.
+monthly budgets, and a 90-day Savings Plan / Reserved Instance commitment
+snapshot (per-account coverage, percentile safe-buy tiers, effective discount
+%, expiring-SP hourly buckets, and a linear 90-day projection of SP-eligible
+on-demand spend). Analyze the JSON below and produce an HTML fragment.
 
 Output rules:
 - Output ONLY an HTML fragment (no <html>, <head>, <body>, no markdown fences).
@@ -2144,7 +2783,7 @@ def main() -> int:
 
     summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
 
-    commitments = build_commitment_summary(rpt_date)
+    commitments = build_commitment_summary(rpt_date, account_map=accounts)
     ai_analysis, ai_enabled = maybe_generate_ai_analysis(
         summaries, insights, commitments, df, rpt_date,
         budgets=_budgets_from_env(),
