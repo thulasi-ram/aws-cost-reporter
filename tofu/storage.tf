@@ -56,7 +56,9 @@ resource "aws_dynamodb_table" "history" {
 # ---------------------------------------------------------------------------
 resource "aws_ssm_parameter" "secrets" {
   name        = "/${local.full_name}/secrets"
-  description = "JSON secret bundle (slack_webhook_url, litellm_api_key, ...). Set via AWS CLI after apply."
+  # Description left as originally deployed: changing it makes the provider
+  # call PutParameter, which we never want touching the live secret value.
+  description = "JSON secret bundle (slack_webhook_url, gemini_api_key, ...). Set via AWS CLI after apply."
   type        = "SecureString"
   value = jsonencode({
     slack_webhook_url   = "PLACEHOLDER"
