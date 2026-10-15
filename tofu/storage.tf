@@ -39,7 +39,7 @@ resource "aws_dynamodb_table" "history" {
 #     "slack_webhook_url":   "https://hooks.slack.com/services/...",
 #     "litellm_api_key":     "sk-...",           // optional — enables AI Analysis
 #     "litellm_base_url":    "https://litellm.treebo.cc", // optional — default shown
-#     "litellm_model":       "flash",            // optional — gateway alias, default shown
+#     "litellm_model":       "cheap",            // optional — gateway alias, default shown
 #     "report_link_key":     "<openssl rand -hex 32>", // optional — enables stable report links
 #     "monthly_budgets_usd": {                   // optional — per-account budget map
 #       "111111111111": 5000,
@@ -64,7 +64,7 @@ resource "aws_ssm_parameter" "secrets" {
     slack_webhook_url   = "PLACEHOLDER"
     litellm_api_key     = ""
     litellm_base_url    = "https://litellm.treebo.cc"
-    litellm_model       = "flash"
+    litellm_model       = "cheap"
     monthly_budgets_usd = {}
   })
 

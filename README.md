@@ -192,7 +192,7 @@ Goes through the LiteLLM gateway (OpenAI-compatible
 {
   "litellm_api_key":  "sk-...",
   "litellm_base_url": "https://litellm.treebo.cc",
-  "litellm_model":    "flash"
+  "litellm_model":    "cheap"
 }
 ```
 

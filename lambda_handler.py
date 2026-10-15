@@ -27,7 +27,7 @@ Required environment variables:
                             litellm_base_url     (optional — default
                                                   https://litellm.treebo.cc)
                             litellm_model        (optional — gateway alias,
-                                                  default "flash")
+                                                  default "cheap")
                             report_link_key      (optional — HMAC key for
                                                   stable report links)
                             monthly_budgets_usd  (optional — {account_id: usd}

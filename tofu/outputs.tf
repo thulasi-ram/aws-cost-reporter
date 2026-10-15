@@ -26,7 +26,7 @@ output "secrets_ssm_parameter" {
           "slack_webhook_url": "https://hooks.slack.com/...",
           "litellm_api_key":   "sk-...",
           "litellm_base_url":  "https://litellm.treebo.cc",
-          "litellm_model":     "flash",
+          "litellm_model":     "cheap",
           "report_link_key":   "<random 32+ bytes, e.g. openssl rand -hex 32>",
           "monthly_budgets_usd": {"111111111111": 5000, "222222222222": 1200}
         }'

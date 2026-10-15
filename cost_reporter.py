@@ -2243,7 +2243,7 @@ def _commitments_payload(c: "CommitmentSummary | None") -> dict | None:
 # -----------------------------------------------------------------------------
 DEFAULT_LITELLM_BASE_URL = "https://litellm.treebo.cc"
 # Gateway alias, not a vendor model ID — the gateway maps it to a provider.
-DEFAULT_LITELLM_MODEL = "flash"
+DEFAULT_LITELLM_MODEL = "cheap"
 
 
 def _ai_model() -> str:
