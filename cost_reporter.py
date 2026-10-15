@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
+from botocore.exceptions import ClientError
 import polars as pl
 
 # -----------------------------------------------------------------------------
@@ -481,12 +482,20 @@ def fetch_sp_coverage(start: date, end_exclusive: date) -> dict:
     )
 
 
-def fetch_sp_coverage_by_account(start: date, end_exclusive: date) -> dict:
+def _linked_account_filter(account_id: str) -> dict:
+    return {"Dimensions": {"Key": "LINKED_ACCOUNT", "Values": [account_id]}}
+
+
+def fetch_sp_coverage_for_account(
+    start: date, end_exclusive: date, account_id: str
+) -> dict:
+    # SP coverage can't GroupBy LINKED_ACCOUNT (only SERVICE / REGION /
+    # INSTANCE_TYPE_FAMILY), so per-account means one filtered call each.
     ce = boto3.client("ce", region_name=CE_REGION)
     return ce.get_savings_plans_coverage(
         TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
-        Granularity="MONTHLY",  # account-level needs an aggregate; daily blows up
-        GroupBy=[{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}],
+        Granularity="MONTHLY",
+        Filter=_linked_account_filter(account_id),
     )
 
 
@@ -498,12 +507,15 @@ def fetch_ri_utilization(start: date, end_exclusive: date) -> dict:
     )
 
 
-def fetch_ri_utilization_by_account(start: date, end_exclusive: date) -> dict:
+def fetch_ri_utilization_for_account(
+    start: date, end_exclusive: date, account_id: str
+) -> dict:
+    # RI utilization only groups by SUBSCRIPTION_ID, so filter per account.
+    # No Granularity: the whole window comes back in `Total`.
     ce = boto3.client("ce", region_name=CE_REGION)
     return ce.get_reservation_utilization(
         TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
-        Granularity="MONTHLY",
-        GroupBy=[{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}],
+        Filter=_linked_account_filter(account_id),
     )
 
 
@@ -518,9 +530,10 @@ def fetch_ri_coverage(start: date, end_exclusive: date) -> dict:
 
 def fetch_ri_coverage_by_account(start: date, end_exclusive: date) -> dict:
     ce = boto3.client("ce", region_name=CE_REGION)
+    # Granularity can't be combined with GroupBy here; the whole window comes
+    # back as a single period.
     return ce.get_reservation_coverage(
         TimePeriod={"Start": start.isoformat(), "End": end_exclusive.isoformat()},
-        Granularity="MONTHLY",
         GroupBy=[{"Type": "DIMENSION", "Key": "LINKED_ACCOUNT"}],
         Metrics=["Hour", "Cost"],
     )
@@ -569,7 +582,9 @@ def build_commitment_summary(
     try:
         c = fetch_sp_coverage(start, end_exclusive)
         cov_pcts: list[float] = []
-        for entry in c.get("CoveragesByTime", []):
+        # SP coverage rows live under SavingsPlansCoverages (RI coverage is the
+        # one that uses CoveragesByTime).
+        for entry in c.get("SavingsPlansCoverages", []):
             day = entry["TimePeriod"]["Start"]
             cov = entry.get("Coverage", {})
             on_demand = _safe_float(cov, "OnDemandCost")
@@ -714,37 +729,57 @@ def build_commitment_summary(
     )
 
     # --- Per-linked-account coverage (also doubles as a fallback when org-level
-    # RI metrics return zero because RI sharing is disabled — querying with
-    # GroupBy=LINKED_ACCOUNT bypasses sharing semantics).
+    # RI metrics return zero because RI sharing is disabled — per-account
+    # queries bypass sharing semantics).
     per_account: dict[str, dict] = {}
-    try:
-        sp_acct = fetch_sp_coverage_by_account(start, end_exclusive)
-        for entry in sp_acct.get("CoveragesByTime", []):
-            for grp in entry.get("Groups", []):
-                acct_id = (grp.get("Attributes", {}) or {}).get("LINKED_ACCOUNT", "")
-                if not acct_id:
-                    continue
-                cov = grp.get("Coverage", {})
-                on_demand = _safe_float(cov, "OnDemandCost")
-                covered = _safe_float(cov, "SpendCoveredBySavingsPlans")
-                cov_pct = _safe_float(cov, "CoveragePercentage")
-                row = per_account.setdefault(acct_id, _empty_account_row(acct_id))
-                row["sp_on_demand"] += on_demand
-                row["sp_covered"] += covered
-                row["_sp_cov_pcts"].append(cov_pct)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("SP coverage by-account fetch failed: %s", e)
+    account_ids = sorted(account_map or {})
+    sp_failures = 0
+    for acct_id in account_ids:
+        try:
+            sp_acct = fetch_sp_coverage_for_account(start, end_exclusive, acct_id)
+        except ClientError as e:
+            # CE's answer for an account with no usage in the window.
+            if e.response.get("Error", {}).get("Code") == "DataUnavailableException":
+                continue
+            sp_failures += 1
+            logger.warning("SP coverage fetch failed for %s: %s", acct_id, e)
+            continue
+        except Exception as e:  # noqa: BLE001
+            sp_failures += 1
+            logger.warning("SP coverage fetch failed for %s: %s", acct_id, e)
+            continue
+        on_demand = covered = 0.0
+        for entry in sp_acct.get("SavingsPlansCoverages", []):
+            cov = entry.get("Coverage", {}) or {}
+            on_demand += _safe_float(cov, "OnDemandCost")
+            covered += _safe_float(cov, "SpendCoveredBySavingsPlans")
+        if on_demand == 0 and covered == 0:
+            continue
+        row = per_account.setdefault(acct_id, _empty_account_row(acct_id))
+        row["sp_on_demand"] += on_demand
+        row["sp_covered"] += covered
+        # Spend-weighted over the window, not a mean of monthly percentages.
+        row["_sp_cov_pcts"].append(100.0 * covered / (covered + on_demand))
+    if sp_failures:
+        logger.warning(
+            "SP coverage by-account: %d/%d accounts failed", sp_failures, len(account_ids)
+        )
 
+    ri_reserved_accounts: set[str] = set()
     try:
         ri_acct_cov = fetch_ri_coverage_by_account(start, end_exclusive)
         for entry in ri_acct_cov.get("CoveragesByTime", []):
             for grp in entry.get("Groups", []):
-                acct_id = (grp.get("Attributes", {}) or {}).get("LINKED_ACCOUNT", "")
+                attrs_ = grp.get("Attributes", {}) or {}
+                # CE returns the group key camelCased ("linkedAccount").
+                acct_id = attrs_.get("linkedAccount") or attrs_.get("LINKED_ACCOUNT", "")
                 if not acct_id:
                     continue
                 attrs = grp.get("Coverage", {})
                 cov_cost = attrs.get("CoverageCost", {}) or {}
                 cov_hrs = attrs.get("CoverageHours", {}) or {}
+                if _safe_float(cov_hrs, "ReservedHours") > 0:
+                    ri_reserved_accounts.add(acct_id)
                 on_demand = _safe_float(cov_cost, "OnDemandCost")
                 reserved = _safe_float(cov_cost, "ReservedCost")
                 cov_pct = _safe_float(cov_hrs, "CoverageHoursPercentage")
@@ -755,27 +790,25 @@ def build_commitment_summary(
     except Exception as e:  # noqa: BLE001
         logger.warning("RI coverage by-account fetch failed: %s", e)
 
-    try:
-        ri_acct_util = fetch_ri_utilization_by_account(start, end_exclusive)
-        for entry in ri_acct_util.get("UtilizationsByTime", []):
-            for grp in entry.get("Groups", []):
-                acct_id = (grp.get("Attributes", {}) or {}).get("LINKED_ACCOUNT", "")
-                if not acct_id:
-                    continue
-                tot = grp.get("Attributes", {})  # group-level attrs
-                util = grp.get("Utilization", {}) or {}
-                util_pct = _safe_float(util, "UtilizationPercentage")
-                purchased = _safe_float(util, "PurchasedHours")
-                unused = _safe_float(util, "UnusedHours")
-                savings = _safe_float(util, "NetRISavings")
-                row = per_account.setdefault(acct_id, _empty_account_row(acct_id))
-                row["ri_purchased_hours"] += purchased
-                row["ri_unused_hours"] += unused
-                row["ri_savings"] += savings
-                row["_ri_util_pcts"].append(util_pct)
-                _ = tot  # silence
-    except Exception as e:  # noqa: BLE001
-        logger.warning("RI utilization by-account fetch failed: %s", e)
+    # Per-account RI utilization costs one CE call per account ($0.01 each),
+    # so only run it when the org actually has reservations in play.
+    if ri_total_purchased > 0 or ri_reserved_accounts:
+        for acct_id in account_ids:
+            try:
+                util = fetch_ri_utilization_for_account(
+                    start, end_exclusive, acct_id
+                ).get("Total", {}) or {}
+            except Exception as e:  # noqa: BLE001
+                logger.warning("RI utilization fetch failed for %s: %s", acct_id, e)
+                continue
+            purchased = _safe_float(util, "PurchasedHours")
+            if purchased == 0:
+                continue
+            row = per_account.setdefault(acct_id, _empty_account_row(acct_id))
+            row["ri_purchased_hours"] += purchased
+            row["ri_unused_hours"] += _safe_float(util, "UnusedHours")
+            row["ri_savings"] += _safe_float(util, "NetRISavings")
+            row["_ri_util_pcts"].append(_safe_float(util, "UtilizationPercentage"))
 
     per_account_rows = []
     name_lookup = account_map or {}
@@ -1996,7 +2029,7 @@ def _render_per_account_table(
         '<h3 style="font-size:15px;margin:24px 0 10px;">Per-account coverage '
         f"— last {section_days} days</h3>"
         '<div class="meta" style="margin:0 0 8px;">'
-        "Aggregated from Cost Explorer with <code>GroupBy=LinkedAccount</code>. "
+        "Queried per linked account from Cost Explorer. "
         "This view sees RIs/SPs even when org-level discount sharing is off."
         "</div>"
         "<table><thead><tr>"

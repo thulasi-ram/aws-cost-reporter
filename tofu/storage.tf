@@ -55,7 +55,7 @@ resource "aws_dynamodb_table" "history" {
 # The `ignore_changes` below keeps Tofu from clobbering it on apply.
 # ---------------------------------------------------------------------------
 resource "aws_ssm_parameter" "secrets" {
-  name        = "/${local.full_name}/secrets"
+  name = "/${local.full_name}/secrets"
   # Description left as originally deployed: changing it makes the provider
   # call PutParameter, which we never want touching the live secret value.
   description = "JSON secret bundle (slack_webhook_url, gemini_api_key, ...). Set via AWS CLI after apply."

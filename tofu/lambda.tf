@@ -39,6 +39,14 @@ resource "aws_iam_role_policy" "runtime" {
         Resource = "*"
       },
       {
+        # Active SP inventory for the expiring-commitments panel. Read-only;
+        # the API has no resource-level scoping worth using here.
+        Sid      = "SavingsPlansRead"
+        Effect   = "Allow"
+        Action   = ["savingsplans:DescribeSavingsPlans"]
+        Resource = "*"
+      },
+      {
         Sid      = "OrganizationsRead"
         Effect   = "Allow"
         Action   = ["organizations:ListAccounts"]
