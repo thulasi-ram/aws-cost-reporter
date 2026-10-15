@@ -9,3 +9,4 @@ build/
 uv.lock
 .DS_Store
 tofu/.terraform/
+tofu/.build/

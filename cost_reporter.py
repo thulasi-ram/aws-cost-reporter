@@ -52,7 +52,7 @@ MONTHLY_LUMP_SERVICES = {
 # Insights thresholds
 DOD_PCT_THRESHOLD = 30.0        # flag DoD moves larger than this %
 DOD_ABS_THRESHOLD_USD = 5.0     # ...and larger than this $ amount
-ANOMALY_MULTIPLIER = 2.0        # yesterday > N× 30d avg
+ANOMALY_MULTIPLIER = 2.0        # day > N× 30d avg
 ANOMALY_MIN_USD = 5.0
 NEW_SERVICE_MIN_USD = 1.0
 DELTA_NOISE_FLOOR_USD = 0.5     # suppress DoD/vs-30d % when both sides are below this
@@ -82,16 +82,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--date",
         default=None,
-        help="Override report day (UTC, YYYY-MM-DD). Defaults to T-1.",
+        help="Override report day (UTC, YYYY-MM-DD). Defaults to T-2; the "
+             "following day is shown as a partial day.",
     )
     return p.parse_args()
 
 
 def resolve_report_day(override: str | None) -> date:
-    """Default to T-1 UTC (yesterday)."""
+    """Default to T-2 UTC — the latest day Cost Explorer has fully billed.
+
+    CE lags ~24h, so T-1 is still filling in at run time and always reads
+    low. T-2 is the report day every comparison is made on; T-1 is carried
+    alongside as the "partial day" (see `partial_day`) and only feeds
+    early-warning anomaly checks.
+    """
     if override:
         return date.fromisoformat(override)
-    return datetime.now(timezone.utc).date() - timedelta(days=1)
+    return datetime.now(timezone.utc).date() - timedelta(days=2)
+
+
+def partial_day(report_date: date) -> date:
+    """The still-filling day after the report day (T-1 on a default run)."""
+    return report_date + timedelta(days=1)
 
 
 # -----------------------------------------------------------------------------
@@ -897,15 +909,20 @@ class AccountSummary:
     account_id: str
     account_name: str
     report_date: date
-    # Per-service table, sorted by yesterday cost desc. EXCLUDES lump services
+    # Per-service table, sorted by report-day cost desc. EXCLUDES lump services
     # (AWS Support etc.) — they are dropped up front because AmortizedCost does
     # not spread them, which would otherwise skew the 30d avg row and trip
     # false Appeared/Disappeared insights.
-    # Columns: service, yesterday, day_before, avg_30d, avg_90d, hist_30d_sum
-    # hist_30d_sum is the T-30..T-1 window (excludes report_date) and is used
-    # purely for "appeared / disappeared" presence detection.
+    # Columns: service, day, day_before, avg_30d, avg_90d, hist_30d_sum, partial
+    # `day` is report_date; `day_before` is report_date-1. Averages end at
+    # report_date, so the partial day never drags them down.
+    # hist_30d_sum is the 30 days before report_date and is used purely for
+    # "appeared / disappeared" presence detection.
+    # `partial` is report_date+1, which CE is still filling in. It is display +
+    # early-warning anomaly input only — never compared against or averaged.
     services: pl.DataFrame
-    total_yesterday: float
+    total_partial: float
+    total_day: float
     total_day_before: float
     total_avg_30d: float
     total_avg_90d: float
@@ -921,11 +938,12 @@ def build_account_summary(
     empty_services = pl.DataFrame(
         schema={
             "service": pl.Utf8,
-            "yesterday": pl.Float64,
+            "day": pl.Float64,
             "day_before": pl.Float64,
             "avg_30d": pl.Float64,
             "avg_90d": pl.Float64,
             "hist_30d_sum": pl.Float64,
+            "partial": pl.Float64,
         }
     )
     # Drop lumpy monthly services before any aggregation (see dataclass note).
@@ -939,7 +957,8 @@ def build_account_summary(
             account_name=account_name,
             report_date=report_date,
             services=empty_services,
-            total_yesterday=0.0,
+            total_partial=0.0,
+            total_day=0.0,
             total_day_before=0.0,
             total_avg_30d=0.0,
             total_avg_90d=0.0,
@@ -948,12 +967,17 @@ def build_account_summary(
     day_before = report_date - timedelta(days=1)
     start_30d = report_date - timedelta(days=29)  # inclusive 30-day window
     start_90d = report_date - timedelta(days=89)  # inclusive 90-day window
-    hist_start = report_date - timedelta(days=30)  # T-30..T-1 (excludes today)
+    hist_start = report_date - timedelta(days=30)  # 30d before the report day
 
-    yesterday = (
+    day = (
         acct.filter(pl.col("date") == report_date)
         .group_by("service")
-        .agg(pl.col("cost").sum().alias("yesterday"))
+        .agg(pl.col("cost").sum().alias("day"))
+    )
+    partial = (
+        acct.filter(pl.col("date") == partial_day(report_date))
+        .group_by("service")
+        .agg(pl.col("cost").sum().alias("partial"))
     )
     prev_day = (
         acct.filter(pl.col("date") == day_before)
@@ -977,18 +1001,20 @@ def build_account_summary(
     )
 
     services = (
-        yesterday.join(prev_day, on="service", how="full", coalesce=True)
+        day.join(prev_day, on="service", how="full", coalesce=True)
         .join(avg_30, on="service", how="full", coalesce=True)
         .join(avg_90, on="service", how="full", coalesce=True)
         .join(hist_30d, on="service", how="full", coalesce=True)
+        .join(partial, on="service", how="full", coalesce=True)
         .fill_null(0.0)
         .filter(
-            (pl.col("yesterday") != 0)
+            (pl.col("day") != 0)
             | (pl.col("day_before") != 0)
             | (pl.col("avg_30d") != 0)
             | (pl.col("avg_90d") != 0)
+            | (pl.col("partial") != 0)
         )
-        .sort("yesterday", descending=True)
+        .sort("day", descending=True)
     )
 
     return AccountSummary(
@@ -996,7 +1022,8 @@ def build_account_summary(
         account_name=account_name,
         report_date=report_date,
         services=services,
-        total_yesterday=float(services["yesterday"].sum()),
+        total_partial=float(services["partial"].sum()),
+        total_day=float(services["day"].sum()),
         total_day_before=float(services["day_before"].sum()),
         total_avg_30d=float(services["avg_30d"].sum()),
         total_avg_90d=float(services["avg_90d"].sum()),
@@ -1013,12 +1040,15 @@ def build_insights(summary: AccountSummary) -> list[str]:
     top-of-report section can skip quiet accounts entirely.
     """
     notes: list[str] = []
-    if summary.services.is_empty() or summary.total_yesterday == 0:
+    if summary.services.is_empty():
         return notes
+    if summary.total_day == 0:
+        # Nothing billed on the report day — only early warnings can apply.
+        return _partial_day_warnings(summary)
 
     for row in summary.services.iter_rows(named=True):
         svc = row["service"]
-        y = row["yesterday"]
+        y = row["day"]
         d = row["day_before"]
         avg30 = row["avg_30d"]
 
@@ -1039,12 +1069,12 @@ def build_insights(summary: AccountSummary) -> list[str]:
                 f"{y / avg30:.1f}x its 30d avg (${avg30:,.2f})"
             )
 
-        # Presence changes vs the T-30..T-1 historical window (excludes today)
+        # Presence changes vs the 30d before the report day
         hist_sum = row["hist_30d_sum"]
         hist_avg = hist_sum / 30.0
         if hist_sum < 0.01 and y >= NEW_SERVICE_MIN_USD:
             notes.append(
-                f"**Appeared** — {svc}: ${y:,.2f} today "
+                f"**Appeared** — {svc}: ${y:,.2f} on the day "
                 "(no spend in previous 30d)"
             )
         elif y < 0.01 and hist_avg >= DROPPED_SERVICE_MIN_AVG_USD:
@@ -1053,6 +1083,38 @@ def build_insights(summary: AccountSummary) -> list[str]:
                 "in previous 30d, now ~$0"
             )
 
+    return notes + _partial_day_warnings(summary)
+
+
+def _partial_day_warnings(summary: AccountSummary) -> list[str]:
+    """Early warnings from the partial day (report_date+1).
+
+    CE is still filling this day in, so its numbers only ever go UP from
+    here. That makes it useless for comparisons (it always reads low) but
+    sound for one-sided checks: if the partial figure alone already clears
+    the anomaly bar, the final figure will too. Drops are deliberately not
+    checked — a low partial day is the expected case, not a signal.
+    """
+    notes: list[str] = []
+    pdate = partial_day(summary.report_date)
+    for row in summary.services.iter_rows(named=True):
+        svc = row["service"]
+        p = row["partial"]
+        avg30 = row["avg_30d"]
+        if p >= ANOMALY_MIN_USD and avg30 > 0 and p >= ANOMALY_MULTIPLIER * avg30:
+            notes.append(
+                f"**Early warning ({pdate}, partial)** — {svc}: already "
+                f"${p:,.2f}, {p / avg30:.1f}x its 30d avg (${avg30:,.2f})"
+            )
+        elif (
+            row["hist_30d_sum"] < 0.01
+            and row["day"] < 0.01
+            and p >= NEW_SERVICE_MIN_USD
+        ):
+            notes.append(
+                f"**Early warning ({pdate}, partial)** — {svc}: new spend "
+                f"${p:,.2f} (nothing in previous 30d)"
+            )
     return notes
 
 
@@ -1220,6 +1282,12 @@ code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 }
 .kpi .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
 .kpi .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.kpi-row.with-partial { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+/* Partial day (CE still filling it in): visible for context, visually
+   demoted so nobody reads it as a real day-over-day number. */
+.kpi.partial { opacity: 0.55; border-style: dashed; }
+.kpi.partial .value { color: var(--muted); }
+th.partial, td.partial { color: var(--muted); opacity: 0.6; font-style: italic; }
 .up { color: var(--up); }
 .down { color: var(--down); }
 .chart-wrap { margin-top: 12px; }
@@ -1257,7 +1325,7 @@ code { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   gap: 18px;
 }
 @media (max-width: 760px) {
-  .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpi-row, .kpi-row.with-partial { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .grid-2 { grid-template-columns: minmax(0, 1fr); }
 }
 table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 14px; }
@@ -1383,15 +1451,28 @@ function chartBase(c) {
 
 function lineOptions(series, opts, c) {
   const base = chartBase(c);
+  // Partial day renders as a dashed, muted segment hanging off the last
+  // complete day, so it reads as "still filling in" rather than a drop.
+  const tail = (opts.partial && series.length)
+    ? [series[series.length - 1], opts.partial] : [];
+  const out = [{ name: opts.name || 'Cost', type: 'area',
+                 data: series.map(d => [d.date, d.cost]) }];
+  if (tail.length) {
+    out.push({ name: 'Partial (CE lag)', type: 'line',
+               data: tail.map(d => [d.date, d.cost]) });
+  }
   return {
     ...base,
     chart: { ...base.chart, type: 'area', height: opts.height || 180 },
-    stroke: { curve: 'smooth', width: 2 },
+    stroke: { curve: 'smooth', width: 2, dashArray: [0, 5] },
     fill: {
-      type: 'gradient',
+      // Line series take their STROKE alpha from fill.opacity, so keep it 1.
+      type: ['gradient', 'solid'],
+      opacity: [1, 1],
       gradient: { shadeIntensity: 0.6, opacityFrom: 0.35, opacityTo: 0.05 },
     },
-    colors: [opts.color || c.accent],
+    legend: { show: false },
+    colors: [opts.color || c.accent, c.muted],
     dataLabels: { enabled: false },
     xaxis: {
       type: 'datetime',
@@ -1406,8 +1487,8 @@ function lineOptions(series, opts, c) {
         formatter: (v) => '$' + Math.round(v).toLocaleString(),
       },
     },
-    tooltip: { ...base.tooltip, y: { formatter: fmtUsd } },
-    series: [{ name: opts.name || 'Cost', data: series.map(d => [d.date, d.cost]) }],
+    tooltip: { ...base.tooltip, shared: false, y: { formatter: fmtUsd } },
+    series: out,
   };
 }
 
@@ -1459,7 +1540,7 @@ function barOptions(services, c) {
     yaxis: { labels: { style: { colors: c.fg, fontSize: '12px' } } },
     tooltip: { ...base.tooltip, y: { formatter: fmtUsd }, x: { show: false } },
     series: [
-      { name: 'Day', data: services.map(s => ({ x: s.service, y: s.yesterday })) },
+      { name: 'Day', data: services.map(s => ({ x: s.service, y: s.day })) },
       { name: '30d avg', data: services.map(s => ({ x: s.service, y: s.avg_30d })) },
     ],
   };
@@ -1577,10 +1658,12 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('[data-tab]').forEach(b => {
     b.addEventListener('click', () => activateTab(b.dataset.tab));
   });
-  renderLine('org-trend', DATA.org_trend, { name: 'Org total', height: 220 });
+  renderLine('org-trend', DATA.org_trend, {
+    name: 'Org total', height: 220, partial: DATA.org_partial,
+  });
   for (const a of DATA.accounts) {
     renderLine('acct-trend-' + a.account_id, a.trend, {
-      name: a.account_name, height: 160,
+      name: a.account_name, height: 160, partial: a.partial,
     });
     renderServicesBar('acct-services-' + a.account_id, a.top_services);
   }
@@ -1630,6 +1713,27 @@ def _delta_pct_html(a: float, b: float) -> str:
     return f'<span class="tag {cls}">{arrow}{abs(pct):.1f}%</span>'
 
 
+def _day_label(d: date) -> str:
+    return d.strftime("%b %d")
+
+
+def _partial_kpi_html(value: float, report_date: date) -> str:
+    """Greyed KPI tile for the partial day. Never carries a delta."""
+    return (
+        '<div class="kpi partial" title="Cost Explorer is still filling this '
+        'day in; shown for context only, not used for comparisons.">'
+        f'<div class="label">{_day_label(partial_day(report_date))} · partial</div>'
+        f'<div class="value">{fmt_usd(value)}</div>'
+        '<div class="sub">CE lag — not compared</div></div>'
+    )
+
+
+def _partial_point(series: list[dict], report_date: date) -> dict | None:
+    """Pull the partial day off a daily series, if it's there."""
+    pdate = partial_day(report_date).isoformat()
+    return next((p for p in series if p["date"] == pdate), None)
+
+
 def _render_insights_html(
     summaries: list[AccountSummary], insights: dict[str, list[str]]
 ) -> str:
@@ -1638,7 +1742,7 @@ def _render_insights_html(
         return (
             '<div class="subsection insights"><h2>Insights</h2>'
             '<p style="color:var(--muted);margin:0">'
-            "Nothing unusual across any account today.</p></div>"
+            "Nothing unusual across any account.</p></div>"
         )
     parts = ['<div class="subsection insights"><h2>Insights</h2>']
     for s in noisy:
@@ -1666,20 +1770,23 @@ def _render_summary_table_html(summaries: list[AccountSummary]) -> str:
             "<tr>"
             f"<td>{html.escape(s.account_name)} "
             f'<code>{html.escape(s.account_id)}</code></td>'
-            f"<td>{fmt_usd(s.total_yesterday)}</td>"
+            f'<td class="partial">{fmt_usd(s.total_partial)}</td>'
+            f"<td>{fmt_usd(s.total_day)}</td>"
             f"<td>{fmt_usd(s.total_day_before)}</td>"
             f"<td>{fmt_usd(s.total_avg_30d)}</td>"
             f"<td>{fmt_usd(s.total_avg_90d)}</td>"
-            f"<td>{_delta_pct_html(s.total_yesterday, s.total_day_before)}</td>"
+            f"<td>{_delta_pct_html(s.total_day, s.total_day_before)}</td>"
             "</tr>"
         )
-    grand_y = sum(s.total_yesterday for s in summaries)
+    grand_partial = sum(s.total_partial for s in summaries)
+    grand_y = sum(s.total_day for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
     grand_30 = sum(s.total_avg_30d for s in summaries)
     grand_90 = sum(s.total_avg_90d for s in summaries)
     rows.append(
         "<tr>"
         "<td><strong>TOTAL</strong></td>"
+        f'<td class="partial">{fmt_usd(grand_partial)}</td>'
         f"<td><strong>{fmt_usd(grand_y)}</strong></td>"
         f"<td><strong>{fmt_usd(grand_p)}</strong></td>"
         f"<td><strong>{fmt_usd(grand_30)}</strong></td>"
@@ -1687,26 +1794,39 @@ def _render_summary_table_html(summaries: list[AccountSummary]) -> str:
         f"<td>{_delta_pct_html(grand_y, grand_p)}</td>"
         "</tr>"
     )
+    rd = summaries[0].report_date if summaries else None
     return (
         '<div class="subsection"><h2>Summary across accounts</h2>'
         "<table><thead><tr>"
-        "<th>Account</th><th>Day</th><th>Day Before</th>"
+        "<th>Account</th>" + _day_headers_html(rd) +
         "<th>30d Avg</th><th>90d Avg</th><th>DoD</th>"
         "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
     )
 
 
+def _day_headers_html(report_date: date | None) -> str:
+    """<th>s for the partial / day / day-before columns, labelled by date."""
+    if report_date is None:
+        return "<th>Partial</th><th>Day</th><th>Day Before</th>"
+    return (
+        f'<th class="partial">{_day_label(partial_day(report_date))} · partial</th>'
+        f"<th>{_day_label(report_date)}</th>"
+        f"<th>{_day_label(report_date - timedelta(days=1))}</th>"
+    )
+
+
 def _render_account_card_html(s: AccountSummary) -> str:
     kpis = (
-        '<div class="kpi-row">'
-        f'<div class="kpi"><div class="label">Day</div>'
-        f'<div class="value">{fmt_usd(s.total_yesterday)}</div></div>'
+        '<div class="kpi-row with-partial">'
+        + _partial_kpi_html(s.total_partial, s.report_date)
+        + f'<div class="kpi"><div class="label">Day · {_day_label(s.report_date)}</div>'
+        f'<div class="value">{fmt_usd(s.total_day)}</div></div>'
         f'<div class="kpi"><div class="label">DoD</div>'
-        f'<div class="value">{_delta_pct_html(s.total_yesterday, s.total_day_before)}</div>'
+        f'<div class="value">{_delta_pct_html(s.total_day, s.total_day_before)}</div>'
         f'<div class="sub">was {fmt_usd(s.total_day_before)}</div></div>'
         f'<div class="kpi"><div class="label">30d avg</div>'
         f'<div class="value">{fmt_usd(s.total_avg_30d)}</div>'
-        f'<div class="sub">vs 30d {_delta_pct_html(s.total_yesterday, s.total_avg_30d)}</div></div>'
+        f'<div class="sub">vs 30d {_delta_pct_html(s.total_day, s.total_avg_30d)}</div></div>'
         f'<div class="kpi"><div class="label">90d avg</div>'
         f'<div class="value">{fmt_usd(s.total_avg_90d)}</div></div>'
         "</div>"
@@ -1716,20 +1836,21 @@ def _render_account_card_html(s: AccountSummary) -> str:
     table_rows = s.services.head(TOP_N_TABLE)
     for i, row in enumerate(table_rows.iter_rows(named=True), 1):
         pct_of_day = (
-            f"{row['yesterday'] / s.total_yesterday * 100:.1f}%"
-            if s.total_yesterday > 0
+            f"{row['day'] / s.total_day * 100:.1f}%"
+            if s.total_day > 0
             else "—"
         )
         rows.append(
             "<tr>"
             f"<td>{i}. {html.escape(row['service'])}</td>"
-            f"<td>{fmt_usd(row['yesterday'])}</td>"
+            f'<td class="partial">{fmt_usd(row["partial"])}</td>'
+            f"<td>{fmt_usd(row['day'])}</td>"
             f"<td>{fmt_usd(row['day_before'])}</td>"
             f"<td>{fmt_usd(row['avg_30d'])}</td>"
             f"<td>{fmt_usd(row['avg_90d'])}</td>"
             f"<td>{pct_of_day}</td>"
-            f"<td>{_delta_pct_html(row['yesterday'], row['day_before'])}</td>"
-            f"<td>{_delta_pct_html(row['yesterday'], row['avg_30d'])}</td>"
+            f"<td>{_delta_pct_html(row['day'], row['day_before'])}</td>"
+            f"<td>{_delta_pct_html(row['day'], row['avg_30d'])}</td>"
             "</tr>"
         )
 
@@ -1753,7 +1874,7 @@ def _render_account_card_html(s: AccountSummary) -> str:
         + kpis
         + charts
         + "<table><thead><tr>"
-        "<th>Service</th><th>Day</th><th>Day Before</th>"
+        "<th>Service</th>" + _day_headers_html(s.report_date) +
         "<th>30d Avg</th><th>90d Avg</th><th>% of Day</th>"
         "<th>DoD</th><th>vs 30d</th>"
         "</tr></thead><tbody>"
@@ -1769,15 +1890,20 @@ def _build_account_payload(
     top_services = [
         {
             "service": row["service"],
-            "yesterday": float(row["yesterday"]),
+            "day": float(row["day"]),
             "avg_30d": float(row["avg_30d"]),
         }
         for row in top.iter_rows(named=True)
     ]
+    series = _account_daily_series(
+        df, s.account_id, partial_day(s.report_date), HTML_TREND_DAYS + 1
+    )
+    partial = _partial_point(series, s.report_date)
     return {
         "account_id": s.account_id,
         "account_name": s.account_name,
-        "trend": _account_daily_series(df, s.account_id, s.report_date, HTML_TREND_DAYS),
+        "trend": [p for p in series if p is not partial],
+        "partial": partial,
         "top_services": top_services,
     }
 
@@ -2113,22 +2239,24 @@ def _commitments_payload(c: "CommitmentSummary | None") -> dict | None:
 
 
 # -----------------------------------------------------------------------------
-# AI analysis (optional — Gemini AI Studio)
+# AI analysis (optional — via the LiteLLM gateway, OpenAI-compatible API)
 # -----------------------------------------------------------------------------
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-GEMINI_ENDPOINT = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "{model}:generateContent?key={key}"
-)
+DEFAULT_LITELLM_BASE_URL = "https://litellm.treebo.cc"
+# Gateway alias, not a vendor model ID — the gateway maps it to a provider.
+DEFAULT_LITELLM_MODEL = "flash"
 
 
-def _gemini_model() -> str:
-    """Resolve the Gemini model at call time (not import time).
+def _ai_model() -> str:
+    """Resolve the model alias at call time (not import time).
 
-    Read late so callers (e.g. the Lambda handler) can populate `GEMINI_MODEL`
+    Read late so callers (e.g. the Lambda handler) can populate `LITELLM_MODEL`
     from a secrets bundle after the module has already been imported.
     """
-    return os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    return os.environ.get("LITELLM_MODEL") or DEFAULT_LITELLM_MODEL
+
+
+def _ai_base_url() -> str:
+    return (os.environ.get("LITELLM_BASE_URL") or DEFAULT_LITELLM_BASE_URL).rstrip("/")
 
 
 AI_TOP_SERVICES = 10
@@ -2137,11 +2265,7 @@ AI_HISTORY_DAYS = 90
 
 
 def _ai_api_key() -> str | None:
-    return (
-        os.environ.get("GEMINI_API_KEY")
-        or os.environ.get("GOOGLE_API_KEY")
-        or os.environ.get("GOOGLE_AI_STUDIO_KEY")
-    )
+    return os.environ.get("LITELLM_API_KEY")
 
 
 def _window_avg_org(df: pl.DataFrame, end: date, days: int) -> float:
@@ -2289,7 +2413,7 @@ def _build_ai_payload(
     the model can reason about variance, burn, and savings opportunities
     without needing to re-aggregate.
     """
-    grand_y = sum(s.total_yesterday for s in summaries)
+    grand_y = sum(s.total_day for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
     budgets = budgets or {}
 
@@ -2312,7 +2436,7 @@ def _build_ai_payload(
         services = [
             {
                 "service": row["service"],
-                "yesterday": round(row["yesterday"], 2),
+                "day": round(row["day"], 2),
                 "day_before": round(row["day_before"], 2),
                 "avg_30d": round(row["avg_30d"], 2),
                 "avg_90d": round(row["avg_90d"], 2),
@@ -2337,7 +2461,7 @@ def _build_ai_payload(
             "account_id": s.account_id,
             "account_name": s.account_name,
             "totals": {
-                "yesterday": round(s.total_yesterday, 2),
+                "day": round(s.total_day, 2),
                 "day_before": round(s.total_day_before, 2),
                 "avg_7d": round(acct_avg_7d, 2),
                 "avg_14d": round(_window_avg_account(df, s.account_id, report_date, 14), 2),
@@ -2401,9 +2525,20 @@ def _build_ai_payload(
 
     return {
         "report_date": report_date.isoformat(),
+        # Kept apart from every other block on purpose: this day is still being
+        # billed, so it must not leak into averages, trends or deltas.
+        "partial_day": {
+            "date": partial_day(report_date).isoformat(),
+            "note": "Incomplete (Cost Explorer ~24h lag). Values only rise. "
+                    "Use for early-warning anomalies only, never comparisons.",
+            "org_total_so_far": round(sum(s.total_partial for s in summaries), 2),
+            "by_account_so_far": {
+                s.account_id: round(s.total_partial, 2) for s in summaries
+            },
+        },
         "history_days": AI_HISTORY_DAYS,
         "org_totals": {
-            "yesterday": round(grand_y, 2),
+            "day": round(grand_y, 2),
             "day_before": round(grand_p, 2),
             "avg_7d": round(org_avg_7d, 2),
             "avg_14d": round(_window_avg_org(df, report_date, 14), 2),
@@ -2429,11 +2564,20 @@ snapshot (per-account coverage, percentile safe-buy tiers, effective discount
 %, expiring-SP hourly buckets, and a linear 90-day projection of SP-eligible
 on-demand spend). Analyze the JSON below and produce an HTML fragment.
 
+About dates: `report_date` is the latest FULLY billed day — "the day" in
+everything below. All history, averages, and day/day_before figures end at
+it. `partial_day` is the following day, which AWS Cost Explorer is still
+filling in (~24h lag), so it always reads low. Never compare against it,
+never fold it into trends or averages, and never call it a drop. Its only
+use is early warning: if a partial figure (or an "Early warning" insight)
+already looks anomalous, the final figure will be at least as bad — raise
+it under Anomalies &amp; Watchlist and label it partial.
+
 Output rules:
 - Output ONLY an HTML fragment (no <html>, <head>, <body>, no markdown fences).
 - Use these tags only: <h3>, <h4>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <code>.
 - No inline styles, no scripts, no images, no links.
-- Open with a 2-3 sentence executive summary in a <p>: today's spend vs 7d/30d/90d
+- Open with a 2-3 sentence executive summary in a <p>: the day's spend vs 7d/30d/90d
   averages, the dominant trend direction, the projected month-end vs budget (if
   known), and the single biggest savings lever.
 
@@ -2445,7 +2589,7 @@ only if the data genuinely doesn't support it; do not pad.
      projected overrun/headroom in USD. List the top 3 accounts ranked by
      projected_pct_of_budget (overruns first); flag any account already past
      100% of MTD pace.
-  2. Trend Snapshot — Compare today vs 7d, 14d, 30d, and 90d averages at the
+  2. Trend Snapshot — Compare the day vs 7d, 14d, 30d, and 90d averages at the
      org level. State whether spend is accelerating, plateauing, or declining,
      and quantify the slope (e.g. "+18% vs 30d, +9% vs 90d"). Note WoW change
      using the last two weekly buckets.
@@ -2460,8 +2604,9 @@ only if the data genuinely doesn't support it; do not pad.
      org-wide. Combine signal across accounts where the same service is rising.
   6. Anomalies &amp; Watchlist — Surprising spikes AND unexpected drops
      (drops can indicate a broken pipeline / lost data ingestion, not a win —
-     treat them as red flags). Include "appeared" / "disappeared" entries
-     from the rule-based insights. Items that warrant follow-up tomorrow.
+     treat them as red flags). Include "appeared" / "disappeared" and
+     "early warning" entries from the rule-based insights. Items that
+     warrant follow-up tomorrow.
   7. Savings Opportunities — A dedicated, AWS-specific savings analysis.
      Walk this checklist explicitly and report each item, even briefly:
        a. Commitments — Savings Plans / RI utilization gaps and whether the
@@ -2513,43 +2658,51 @@ def _strip_html_fences(text: str) -> str:
 
 
 def generate_ai_analysis(payload: dict, api_key: str) -> str | None:
-    """Call Gemini AI Studio. Returns an HTML fragment or None on error."""
+    """Call the LiteLLM gateway. Returns an HTML fragment or None on error."""
     body = {
-        "contents": [
+        "model": _ai_model(),
+        "messages": [
             {
                 "role": "user",
-                "parts": [
-                    {"text": _AI_PROMPT + json.dumps(payload, separators=(",", ":"))}
-                ],
+                "content": _AI_PROMPT + json.dumps(payload, separators=(",", ":")),
             }
         ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 4096,
-            "responseMimeType": "text/plain",
-        },
+        "temperature": 0.3,
+        # Generous: thinking models spend part of this budget before answering.
+        "max_tokens": 16384,
     }
-    url = GEMINI_ENDPOINT.format(model=_gemini_model(), key=api_key)
     req = urllib.request.Request(
-        url,
+        f"{_ai_base_url()}/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
-        logger.warning("Gemini call failed: %s", e)
+    except urllib.error.HTTPError as e:
+        # Gateway errors (bad key, budget exhausted, unknown model) carry the
+        # reason in the body — surface it instead of a bare status code.
+        detail = e.read().decode("utf-8", errors="replace")[:300]
+        logger.warning("LiteLLM call failed: HTTP %s %s", e.code, detail)
+        return None
+    except (urllib.error.URLError, TimeoutError) as e:
+        logger.warning("LiteLLM call failed: %s", e)
         return None
     except json.JSONDecodeError as e:
-        logger.warning("Gemini returned non-JSON: %s", e)
+        logger.warning("LiteLLM returned non-JSON: %s", e)
         return None
 
     try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
-        logger.warning("Gemini response missing text: %s", str(data)[:300])
+        logger.warning("LiteLLM response missing text: %s", str(data)[:300])
+        return None
+    if not text:
+        logger.warning("LiteLLM returned empty content: %s", str(data)[:300])
         return None
 
     return _strip_html_fences(text) or None
@@ -2563,7 +2716,7 @@ def maybe_generate_ai_analysis(
     report_date: date,
     budgets: dict[str, float] | None = None,
 ) -> tuple[str | None, bool]:
-    """Generate AI analysis if a Gemini API key is in the env.
+    """Generate AI analysis if a LiteLLM API key is in the env.
 
     Returns (analysis_html, enabled). `enabled` reflects whether a key was
     found, regardless of whether the API call ultimately succeeded.
@@ -2574,9 +2727,9 @@ def maybe_generate_ai_analysis(
     """
     key = _ai_api_key()
     if not key:
-        logger.info("No GEMINI_API_KEY in env — skipping AI analysis")
+        logger.info("No LITELLM_API_KEY in env — skipping AI analysis")
         return None, False
-    logger.info("Generating AI analysis with %s", _gemini_model())
+    logger.info("Generating AI analysis with %s via %s", _ai_model(), _ai_base_url())
     payload = _build_ai_payload(
         summaries, insights, commitments, df, report_date, budgets=budgets
     )
@@ -2664,13 +2817,17 @@ def write_report(
                 "service": pl.Utf8, "cost": pl.Float64}
     )
 
-    grand_y = sum(s.total_yesterday for s in summaries)
+    grand_partial = sum(s.total_partial for s in summaries)
+    grand_y = sum(s.total_day for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
     grand_30 = sum(s.total_avg_30d for s in summaries)
     grand_90 = sum(s.total_avg_90d for s in summaries)
 
+    org_series = _org_daily_series(df, partial_day(report_date), HTML_TREND_DAYS + 1)
+    org_partial = _partial_point(org_series, report_date)
     payload = {
-        "org_trend": _org_daily_series(df, report_date, HTML_TREND_DAYS),
+        "org_trend": [p for p in org_series if p is not org_partial],
+        "org_partial": org_partial,
         "accounts": [_build_account_payload(s, df, TOP_N_TABLE) for s in summaries],
         "commitments": _commitments_payload(commitments),
     }
@@ -2686,9 +2843,12 @@ def write_report(
         " · AmortizedCost · excludes "
         f"{', '.join(EXCLUDED_RECORD_TYPES)}"
         f" and lumpy services ({', '.join(sorted(MONTHLY_LUMP_SERVICES))})."
+        f" Comparisons use {report_date} (latest fully-billed day);"
+        f" {partial_day(report_date)} is partial and only feeds early warnings."
         "</div>"
-        '<div class="kpi-row">'
-        f'<div class="kpi"><div class="label">Org total (Day)</div>'
+        '<div class="kpi-row with-partial">'
+        + _partial_kpi_html(grand_partial, report_date)
+        + f'<div class="kpi"><div class="label">Org total · {_day_label(report_date)}</div>'
         f'<div class="value">{fmt_usd(grand_y)}</div></div>'
         f'<div class="kpi"><div class="label">DoD</div>'
         f'<div class="value">{_delta_pct_html(grand_y, grand_p)}</div>'
@@ -2712,7 +2872,7 @@ def write_report(
 
     daily_panel = (
         '<div id="tab-daily" class="tab-panel active">'
-        + _render_ai_panel_html(ai_analysis, ai_enabled, _gemini_model())
+        + _render_ai_panel_html(ai_analysis, ai_enabled, _ai_model())
         + overview
         + "".join(_render_account_card_html(s) for s in summaries)
         + "</div>"
@@ -2766,8 +2926,12 @@ def main() -> int:
 
     rpt_date = resolve_report_day(args.date)
     start = rpt_date - timedelta(days=LOOKBACK_DAYS - 1)
-    end_exclusive = rpt_date + timedelta(days=1)
-    logger.info("Report day: %s UTC (window %s -> %s inclusive)", rpt_date, start, rpt_date)
+    # Fetch through the partial day too; it's split out in the summaries.
+    end_exclusive = partial_day(rpt_date) + timedelta(days=1)
+    logger.info(
+        "Report day: %s UTC (window %s -> %s inclusive, %s partial)",
+        rpt_date, start, rpt_date, partial_day(rpt_date),
+    )
 
     accounts = fetch_account_map()
     df = build_cost_dataframe(start, end_exclusive)
@@ -2781,7 +2945,7 @@ def main() -> int:
         summaries.append(summary)
         insights[acct_id] = build_insights(summary)
 
-    summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
+    summaries.sort(key=lambda s: s.total_day, reverse=True)
 
     commitments = build_commitment_summary(rpt_date, account_map=accounts)
     ai_analysis, ai_enabled = maybe_generate_ai_analysis(

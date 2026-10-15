@@ -2,10 +2,11 @@
 
 Procedural flow:
   1. Read config from environment (set by the Tofu-provisioned Lambda)
-  2. Resolve the JSON secret bundle from SSM (Slack webhook + optional Gemini key)
+  2. Resolve the JSON secret bundle from SSM (Slack webhook + optional LiteLLM key)
   3. Run the shared pipeline from cost_reporter.py (CE -> polars -> HTML)
   4. Persist the report-day slice to DynamoDB (history + future trend queries)
-  5. Upload the HTML report to S3, generate a presigned URL (7 days)
+  5. Upload the HTML report to S3 and mint a stable link to it (see
+     link_handler.py; falls back to a presigned URL if links aren't set up)
   6. Post a Slack Block Kit message (rich tables, no images) via urllib
   7. Write the run marker to DynamoDB (audit trail of last successful run)
   8. On any failure, post a short Slack error and re-raise so the CloudWatch
@@ -22,13 +23,23 @@ Required environment variables:
     DYNAMODB_TABLE      — table for history + run markers
     SECRETS_SSM_PARAM   — SSM SecureString name holding a JSON object:
                             slack_webhook_url    (required)
-                            gemini_api_key       (optional — enables AI Analysis)
-                            gemini_model         (optional — default gemini-2.5-flash)
+                            litellm_api_key      (optional — enables AI Analysis)
+                            litellm_base_url     (optional — default
+                                                  https://litellm.treebo.cc)
+                            litellm_model        (optional — gateway alias,
+                                                  default "flash")
+                            report_link_key      (optional — HMAC key for
+                                                  stable report links)
                             monthly_budgets_usd  (optional — {account_id: usd}
                                                   monthly budget map; enables
                                                   burn-vs-budget analysis)
 Optional:
-    PRESIGNED_URL_TTL_DAYS — default 7 (the S3 SigV4 maximum)
+    REPORT_LINK_BASE_URL   — Function URL of the link redirector; with
+                             report_link_key, Slack gets a link that never
+                             expires
+    PRESIGNED_URL_TTL_DAYS — fallback presigned URL TTL, default 7. NB: the
+                             URL really dies when the Lambda's STS session
+                             does (hours), whatever this says
     ENVIRONMENT            — label shown in the Slack title (default: prod)
 """
 
@@ -58,9 +69,12 @@ from cost_reporter import (
     fmt_delta_pct,
     fmt_usd,
     maybe_generate_ai_analysis,
+    partial_day,
     resolve_report_day,
     write_report,
 )
+from link_handler import report_key as _report_key
+from link_handler import report_link
 
 logger = logging.getLogger("cost_reporter.lambda")
 logger.setLevel(logging.INFO)
@@ -87,6 +101,7 @@ def _load_config() -> dict[str, Any]:
         "ddb_table": _env("DYNAMODB_TABLE"),
         "ssm_param": _env("SECRETS_SSM_PARAM"),
         "ttl_days": int(_env("PRESIGNED_URL_TTL_DAYS", "7", required=False)),
+        "link_base_url": _env("REPORT_LINK_BASE_URL", "", required=False),
         "environment": _env("ENVIRONMENT", "prod", required=False),
     }
 
@@ -96,7 +111,7 @@ def _load_secrets(ssm_param: str) -> dict[str, str]:
 
     Expected keys:
         slack_webhook_url  (required)
-        gemini_api_key     (optional — enables AI Analysis)
+        litellm_api_key    (optional — enables AI Analysis)
     """
     resp = _SSM.get_parameter(Name=ssm_param, WithDecryption=True)
     raw = resp["Parameter"]["Value"]
@@ -250,9 +265,10 @@ def _table_row(service: str, day: float, day_before: float, avg_30d: float) -> s
 
 
 def _account_table(s: AccountSummary) -> str:
+    day_label = f"{s.report_date:%b %d}"
     header = (
         f"{'Service':<{_COL_SERVICE}} "
-        f"{'Day':>{_COL_USD}} "
+        f"{day_label:>{_COL_USD}} "
         f"{'DoD':>{_COL_PCT}} "
         f"{'30d avg':>{_COL_USD}} "
         f"{'vs 30d':>{_COL_PCT}}"
@@ -264,13 +280,13 @@ def _account_table(s: AccountSummary) -> str:
     for row in s.services.head(TOP_N_SLACK).iter_rows(named=True):
         rows.append(
             _table_row(
-                row["service"], row["yesterday"], row["day_before"], row["avg_30d"]
+                row["service"], row["day"], row["day_before"], row["avg_30d"]
             )
         )
     rows.append(rule_dotted)
     rows.append(
         _table_row(
-            "TOTAL", s.total_yesterday, s.total_day_before, s.total_avg_30d
+            "TOTAL", s.total_day, s.total_day_before, s.total_avg_30d
         )
     )
     return "\n".join(rows)
@@ -325,7 +341,8 @@ def _slack_payload(
     ]
 
     # --- Org totals ---
-    grand_y = sum(s.total_yesterday for s in summaries)
+    grand_partial = sum(s.total_partial for s in summaries)
+    grand_y = sum(s.total_day for s in summaries)
     grand_p = sum(s.total_day_before for s in summaries)
     grand_30 = sum(s.total_avg_30d for s in summaries)
     grand_90 = sum(s.total_avg_90d for s in summaries)
@@ -333,7 +350,7 @@ def _slack_payload(
         {
             "type": "section",
             "fields": [
-                _mrkdwn(f"*Org total (Day)*\n{fmt_usd(grand_y)}"),
+                _mrkdwn(f"*Org total ({report_date:%b %d})*\n{fmt_usd(grand_y)}"),
                 _mrkdwn(
                     f"*DoD* {_delta_emoji(grand_y, grand_p)}\n"
                     f"{_dod(grand_y, grand_p)}  _was {fmt_usd(grand_p)}_"
@@ -343,6 +360,18 @@ def _slack_payload(
                     f"_({_dod(grand_y, grand_30)})_"
                 ),
                 _mrkdwn(f"*90d avg*\n{fmt_usd(grand_90)}"),
+            ],
+        }
+    )
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                _mrkdwn(
+                    f"_{partial_day(report_date):%b %d} so far: "
+                    f"{fmt_usd(grand_partial)} — partial (Cost Explorer lag), "
+                    "not used for comparisons; only feeds early warnings._"
+                )
             ],
         }
     )
@@ -366,7 +395,7 @@ def _slack_payload(
         blocks.append(
             _section(
                 ":white_check_mark: *Insights*\n"
-                "_Nothing unusual across any account today._"
+                "_Nothing unusual across any account._"
             )
         )
     blocks.append(DIVIDER)
@@ -462,15 +491,17 @@ def handler(event: dict, context: object) -> dict:
     secrets = _load_secrets(cfg["ssm_param"])
     webhook_url = secrets["slack_webhook_url"]
 
-    # Expose Gemini config (when present) via env so cost_reporter's AI helper
+    # Expose LiteLLM config (when present) via env so cost_reporter's AI helper
     # picks it up without needing a parameter-passing detour. Keeping a single
     # source of config in the SSM bundle — no duplicate Lambda env vars.
-    gemini_key = secrets.get("gemini_api_key", "").strip()
-    if gemini_key:
-        os.environ["GEMINI_API_KEY"] = gemini_key
-    gemini_model = secrets.get("gemini_model", "").strip()
-    if gemini_model:
-        os.environ["GEMINI_MODEL"] = gemini_model
+    for secret_key, env_key in (
+        ("litellm_api_key", "LITELLM_API_KEY"),
+        ("litellm_base_url", "LITELLM_BASE_URL"),
+        ("litellm_model", "LITELLM_MODEL"),
+    ):
+        value = str(secrets.get(secret_key) or "").strip()
+        if value:
+            os.environ[env_key] = value
 
     # Per-account monthly budgets (USD). Optional. Coerce numeric values and
     # drop anything malformed rather than failing the run.
@@ -499,12 +530,14 @@ def handler(event: dict, context: object) -> dict:
 
         # --- Shared pipeline (same functions the CLI uses) ---
         start = report_date - timedelta(days=LOOKBACK_DAYS - 1)
-        end_exclusive = report_date + timedelta(days=1)
+        # Fetch through the partial day too; it's split out in the summaries.
+        end_exclusive = partial_day(report_date) + timedelta(days=1)
         logger.info(
-            "Generating report for %s (window %s -> %s inclusive)",
+            "Generating report for %s (window %s -> %s inclusive, %s partial)",
             report_date,
             start,
             report_date,
+            partial_day(report_date),
         )
 
         accounts = fetch_account_map()
@@ -517,7 +550,7 @@ def handler(event: dict, context: object) -> dict:
             summaries.append(s)
             insights[acct_id] = build_insights(s)
 
-        summaries.sort(key=lambda s: s.total_yesterday, reverse=True)
+        summaries.sort(key=lambda s: s.total_day, reverse=True)
         commitments = build_commitment_summary(report_date, account_map=accounts)
         ai_analysis, ai_enabled = maybe_generate_ai_analysis(
             summaries, insights, commitments, df, report_date,
@@ -535,13 +568,26 @@ def handler(event: dict, context: object) -> dict:
         )
 
         # --- Persist raw data to DynamoDB (unfiltered: includes lump services) ---
+        # Only the fully-billed report day; the partial day lands tomorrow
+        # (and overwrites any partial rows older runs wrote for it).
         _persist_history(cfg["ddb_table"], df, report_date)
 
         # --- Upload HTML report to S3 and presign ---
-        report_key = f"reports/{report_date.isoformat()}/report.html"
+        report_key = _report_key(report_date.isoformat())
         _upload_artifact(cfg["s3_bucket"], report_key, report_path, "text/html")
-        ttl_seconds = cfg["ttl_days"] * 24 * 3600
-        report_url = _presign(cfg["s3_bucket"], report_key, ttl_seconds)
+        link_key = str(secrets.get("report_link_key") or "").strip()
+        if cfg["link_base_url"] and link_key:
+            report_url = report_link(
+                cfg["link_base_url"], link_key, report_date.isoformat()
+            )
+        else:
+            logger.warning(
+                "Stable report links not configured (REPORT_LINK_BASE_URL / "
+                "report_link_key) — falling back to a presigned URL that "
+                "expires with this Lambda's session"
+            )
+            ttl_seconds = cfg["ttl_days"] * 24 * 3600
+            report_url = _presign(cfg["s3_bucket"], report_key, ttl_seconds)
 
         # --- Post to Slack ---
         payload = _slack_payload(

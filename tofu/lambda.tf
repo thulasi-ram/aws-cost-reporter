@@ -84,6 +84,7 @@ resource "null_resource" "build_zip" {
   triggers = {
     cost_reporter  = filesha256("${path.module}/../cost_reporter.py")
     lambda_handler = filesha256("${path.module}/../lambda_handler.py")
+    link_handler   = filesha256("${path.module}/../link_handler.py")
     build_script   = filesha256("${path.module}/../scripts/build.sh")
     lockfile       = filesha256("${path.module}/../uv.lock")
   }
@@ -105,6 +106,7 @@ resource "aws_s3_object" "lambda_zip" {
   source_hash = sha256(join("", [
     filesha256("${path.module}/../cost_reporter.py"),
     filesha256("${path.module}/../lambda_handler.py"),
+    filesha256("${path.module}/../link_handler.py"),
     filesha256("${path.module}/../uv.lock"),
     filesha256("${path.module}/../scripts/build.sh"),
   ]))
@@ -129,6 +131,7 @@ resource "aws_lambda_function" "reporter" {
   source_code_hash = sha256(join("", [
     filesha256("${path.module}/../cost_reporter.py"),
     filesha256("${path.module}/../lambda_handler.py"),
+    filesha256("${path.module}/../link_handler.py"),
   ]))
 
   memory_size = var.lambda_memory_mb
@@ -141,6 +144,7 @@ resource "aws_lambda_function" "reporter" {
       SECRETS_SSM_PARAM      = aws_ssm_parameter.secrets.name
       ENVIRONMENT            = var.environment
       PRESIGNED_URL_TTL_DAYS = "7"
+      REPORT_LINK_BASE_URL   = aws_lambda_function_url.links.function_url
     }
   }
 

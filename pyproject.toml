@@ -16,4 +16,5 @@ dependencies = [
 include = [
     "cost_reporter.py",
     "lambda_handler.py",
+    "link_handler.py",
 ]

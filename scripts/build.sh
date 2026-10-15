@@ -37,7 +37,7 @@ VIRTUAL_ENV="" uv pip install \
   -r "${BUILD_DIR}/requirements.txt"
 
 echo "==> Copying project modules"
-cp cost_reporter.py lambda_handler.py "${PKG_DIR}/"
+cp cost_reporter.py lambda_handler.py link_handler.py "${PKG_DIR}/"
 
 # Strip things Lambda never needs.
 echo "==> Trimming package"

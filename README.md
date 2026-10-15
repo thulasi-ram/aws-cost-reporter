@@ -132,7 +132,7 @@ All provisioned by tofu except the S3 bucket:
 | SSM SecureString | Slack webhook. Tofu sets a placeholder, `ignore_changes = [value]` so your real value survives. |
 | Lambda (zip, python3.12) | Reads from S3. |
 | IAM role + inline policy | CE, Organizations, S3, DynamoDB, SSM. |
-| EventBridge rule | `cron(30 8 * * ? *)` — daily 08:30 UTC / 14:00 IST (later run lets AWS Cost Explorer finalize T-1). |
+| EventBridge rule | `cron(30 8 * * ? *)` — daily 08:30 UTC / 14:00 IST. |
 | CloudWatch log group | 30-day retention. |
 | CloudWatch alarm | Fires on ≥1 Lambda error in a 24 h window. |
 
@@ -169,14 +169,49 @@ gets repeated, which is the point of a manual invoke.
 aws logs tail "$(cd tofu && tofu output -raw cloudwatch_log_group)" --follow
 ```
 
+## Which day is reported
+
+Cost Explorer lags ~24 h, so at run time T-1 is still being billed and
+always reads low. The **report day is T-2** — the latest fully-billed day —
+and every comparison (DoD, vs 30d, averages, MTD, burn, AI analysis) is
+made on it. T-1 is still shown, greyed out and labelled *partial*, and is
+used for exactly one thing: **early-warning anomalies**. Partial numbers
+only ever go up, so if a service's partial T-1 already clears the anomaly
+bar (≥2× its 30d avg and ≥$5) or shows brand-new spend, the final figure
+will too. Drops on the partial day are never flagged.
+
+`--date` / `{"date": ...}` overrides the report day; the day after it is
+treated as the partial day.
+
+## AI analysis (optional)
+
+Goes through the LiteLLM gateway (OpenAI-compatible
+`/v1/chat/completions`), not a provider key. Add to the SSM bundle:
+
+```json
+{
+  "litellm_api_key":  "sk-...",
+  "litellm_base_url": "https://litellm.treebo.cc",
+  "litellm_model":    "flash"
+}
+```
+
+Only `litellm_api_key` is required; the other two default to the values
+shown. `litellm_model` is a gateway alias, not a vendor model ID. For local
+runs, set `LITELLM_API_KEY` (and optionally `LITELLM_BASE_URL`,
+`LITELLM_MODEL`) in the environment.
+
 ## What the Slack message contains
 
 - **Header** with the report date and environment.
-- **Org totals** as a 4-field block: org total, DoD, 30d avg, vs 30d.
+- **Org totals** as a 4-field block: org total, DoD, 30d avg, vs 30d —
+  all on the report day (T-2) — plus a context line with the partial T-1
+  figure so far.
 - **Insights** merged across all accounts — quiet accounts are skipped.
   Rules: DoD jumps (≥30 % and ≥$5), anomalies vs 30d baseline (≥2× and
-  ≥$5), services appeared/disappeared vs the previous 30d, and an
-  EC2-Other breakdown (EBS / data transfer / misc).
+  ≥$5), services appeared/disappeared vs the previous 30d, early
+  warnings from the partial day, and an EC2-Other breakdown (EBS / data
+  transfer / misc).
 - **Per-account table**: each account gets its own `header` + `context` +
   a `rich_text_preformatted` block rendering an aligned monospace table
   (Service | Day | DoD | 30d avg | vs 30d) with the account TOTAL as
@@ -190,9 +225,10 @@ aws logs tail "$(cd tofu && tofu output -raw cloudwatch_log_group)" --follow
 Single self-contained HTML file — no build step, ApexCharts loaded from a
 CDN at view time. Lives at `reports/{date}/report.html` in the bucket.
 
-- Org-level KPI strip + 30-day trend line.
+- Org-level KPI strip (greyed partial-day tile first) + 30-day trend line
+  with the partial day drawn as a dashed grey tail.
 - Insights section (same rules as Slack).
-- Summary-across-accounts table.
+- Summary-across-accounts table (greyed partial-day column).
 - One card per account with a 30-day sparkline, a Day-vs-30d-avg bar
   chart of the top services, and a full top-15 service table.
 

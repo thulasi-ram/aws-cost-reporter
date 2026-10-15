@@ -31,14 +31,16 @@ resource "aws_dynamodb_table" "history" {
 # ---------------------------------------------------------------------------
 # SSM SecureString — consolidated JSON secret bundle for this app.
 # One parameter holds every secret the Lambda needs (Slack webhook,
-# Gemini API key, etc.) so we can add new keys without provisioning new
+# LiteLLM virtual key, etc.) so we can add new keys without provisioning new
 # resources or expanding IAM.
 #
 # Expected JSON shape:
 #   {
 #     "slack_webhook_url":   "https://hooks.slack.com/services/...",
-#     "gemini_api_key":      "AIza...",          // optional — enables AI Analysis
-#     "gemini_model":        "gemini-2.5-flash", // optional — override default
+#     "litellm_api_key":     "sk-...",           // optional — enables AI Analysis
+#     "litellm_base_url":    "https://litellm.treebo.cc", // optional — default shown
+#     "litellm_model":       "flash",            // optional — gateway alias, default shown
+#     "report_link_key":     "<openssl rand -hex 32>", // optional — enables stable report links
 #     "monthly_budgets_usd": {                   // optional — per-account budget map
 #       "111111111111": 5000,
 #       "222222222222": 1200
@@ -48,18 +50,19 @@ resource "aws_dynamodb_table" "history" {
 # Tofu creates the parameter shell with a placeholder. Set the real value
 # out-of-band (so it never lives in state files / Tofu plans):
 #   aws ssm put-parameter --name <name> \
-#       --value '{"slack_webhook_url":"...","gemini_api_key":"..."}' \
+#       --value '{"slack_webhook_url":"...","litellm_api_key":"sk-..."}' \
 #       --type SecureString --overwrite
 # The `ignore_changes` below keeps Tofu from clobbering it on apply.
 # ---------------------------------------------------------------------------
 resource "aws_ssm_parameter" "secrets" {
   name        = "/${local.full_name}/secrets"
-  description = "JSON secret bundle (slack_webhook_url, gemini_api_key, ...). Set via AWS CLI after apply."
+  description = "JSON secret bundle (slack_webhook_url, litellm_api_key, ...). Set via AWS CLI after apply."
   type        = "SecureString"
   value = jsonencode({
     slack_webhook_url   = "PLACEHOLDER"
-    gemini_api_key      = ""
-    gemini_model        = "gemini-2.5-flash"
+    litellm_api_key     = ""
+    litellm_base_url    = "https://litellm.treebo.cc"
+    litellm_model       = "flash"
     monthly_budgets_usd = {}
   })
 

@@ -1,3 +1,8 @@
+output "report_link_base_url" {
+  description = "Function URL behind the stable report links posted to Slack"
+  value       = aws_lambda_function_url.links.function_url
+}
+
 output "lambda_function_name" {
   description = "Name of the Lambda function (for manual invoke / logs)"
   value       = aws_lambda_function.reporter.function_name
@@ -19,8 +24,10 @@ output "secrets_ssm_parameter" {
       aws ssm put-parameter --name <name> --type SecureString --overwrite \
         --value '{
           "slack_webhook_url": "https://hooks.slack.com/...",
-          "gemini_api_key":    "AIza...",
-          "gemini_model":      "gemini-2.5-flash",
+          "litellm_api_key":   "sk-...",
+          "litellm_base_url":  "https://litellm.treebo.cc",
+          "litellm_model":     "flash",
+          "report_link_key":   "<random 32+ bytes, e.g. openssl rand -hex 32>",
           "monthly_budgets_usd": {"111111111111": 5000, "222222222222": 1200}
         }'
   EOT
