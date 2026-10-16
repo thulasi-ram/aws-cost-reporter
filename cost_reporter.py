@@ -2293,6 +2293,7 @@ def _ai_base_url() -> str:
 
 
 AI_TOP_SERVICES = 10
+AI_TIMEOUT_SECONDS = 210
 # How many days of daily history we feed the LLM (org + per-account series).
 AI_HISTORY_DAYS = 90
 
@@ -2714,7 +2715,9 @@ def generate_ai_analysis(payload: dict, api_key: str) -> str | None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        # Slow gateway models (e.g. `cheap`) take 70-120s+ for this prompt.
+        # The rest of the run is ~30s, so this still fits the 300s Lambda limit.
+        with urllib.request.urlopen(req, timeout=AI_TIMEOUT_SECONDS) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         # Gateway errors (bad key, budget exhausted, unknown model) carry the
